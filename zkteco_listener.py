@@ -5,7 +5,7 @@ It keeps a small in-memory set of already-seen attendance records and prints
 only new user IDs as they appear.
 
 Requirements:
-  pip install zk
+  pip install pyzk
 
 Run:
   python zkteco_listener.py
@@ -63,7 +63,9 @@ else:
 def _webhook_worker():
     while True:
         ip, name, userid, ts = _webhook_q.get()
-        payload = {"ip": ip, "device": name, "userid": userid, "timestamp": ts}
+        # Get local machine IP
+        local_ip = socket.gethostbyname(socket.gethostname())
+        payload = {"device_ip": ip, "local_ip": local_ip, "device": name, "userid": userid, "timestamp": ts}
         headers = {"Content-Type": "application/json"}
         # simple retry with backoff
         attempt = 0

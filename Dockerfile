@@ -16,9 +16,9 @@ RUN apt-get update \
 
 # (Optional) Install Microsoft ODBC Driver for SQL Server (linux) so pyodbc can connect to MSSQL
 # Note: uncomment the following block if you need MS ODBC support and you are running on a supported Debian/Ubuntu base
-# RUN curl https://packages.microsoft.com/keys/microsoft.asc | apt-key add - \
-#     && curl https://packages.microsoft.com/config/debian/11/prod.list > /etc/apt/sources.list.d/mssql-release.list \
-#     && apt-get update && ACCEPT_EULA=Y apt-get install -y msodbcsql18
+RUN curl https://packages.microsoft.com/keys/microsoft.asc | apt-key add - \
+    && curl https://packages.microsoft.com/config/debian/11/prod.list > /etc/apt/sources.list.d/mssql-release.list \
+    && apt-get update && ACCEPT_EULA=Y apt-get install -y msodbcsql18
 
 # Create app directory
 WORKDIR /app
