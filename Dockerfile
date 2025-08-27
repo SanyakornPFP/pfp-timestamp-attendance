@@ -1,5 +1,5 @@
 # Start from slim Python image
-FROM python:3.11-slim
+FROM python:3.11-slim-bullseye
 
 # Install system dependencies needed for building extensions and ODBC
 RUN apt-get update \
