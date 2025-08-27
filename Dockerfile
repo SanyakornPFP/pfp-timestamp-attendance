@@ -14,11 +14,18 @@ RUN apt-get update \
        g++ \
     && rm -rf /var/lib/apt/lists/*
 
-# (Optional) Install Microsoft ODBC Driver for SQL Server (linux) so pyodbc can connect to MSSQL
-# Note: uncomment the following block if you need MS ODBC support and you are running on a supported Debian/Ubuntu base
-# RUN curl https://packages.microsoft.com/keys/microsoft.asc | apt-key add - \
-#     && curl https://packages.microsoft.com/config/debian/11/prod.list > /etc/apt/sources.list.d/mssql-release.list \
-#     && apt-get update && ACCEPT_EULA=Y apt-get install -y msodbcsql18
+# Install Microsoft ODBC Driver for SQL Server so pyodbc can connect to MSSQL.
+# This block detects the Debian codename at build-time and registers Microsoft's repo
+# then installs msodbcsql17 (compatible with ODBC Driver 17). Keep unixodbc-dev installed
+# so that pip can build/consume pyodbc if needed.
+RUN set -eux; \
+    curl https://packages.microsoft.com/keys/microsoft.asc | apt-key add -; \
+    CODENAME=$(grep VERSION_CODENAME /etc/os-release | cut -d= -f2 || echo "bookworm"); \
+    curl "https://packages.microsoft.com/config/debian/${CODENAME}/prod.list" \
+        > /etc/apt/sources.list.d/mssql-release.list; \
+    apt-get update; \
+    ACCEPT_EULA=Y apt-get install -y --no-install-recommends msodbcsql17; \
+    rm -rf /var/lib/apt/lists/*
 
 # Create app directory
 WORKDIR /app
@@ -27,7 +34,8 @@ WORKDIR /app
 COPY . /app
 
 # Install Python dependencies
-RUN pip install --no-cache-dir -r requirements.txt
+RUN pip install --no-cache-dir --upgrade pip setuptools wheel \
+ && pip install --no-cache-dir -r requirements.txt
 
 # Default environment variables (can be overridden at runtime)
 ENV N8N_WEBHOOK_URL="https://n8n.pfpintranet.com/webhook-test/c70ded1f-e6e4-4cb2-8038-4407e733a546"
