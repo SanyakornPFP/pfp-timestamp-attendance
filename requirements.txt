@@ -1,0 +1,5 @@
+# Minimal requirements for the listener
+zk
+requests
+python-dotenv
+pyodbc

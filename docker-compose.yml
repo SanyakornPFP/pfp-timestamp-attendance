@@ -1,0 +1,22 @@
+version: '3.8'
+services:
+  zkteco-listener:
+    build: .
+    container_name: zkteco_listener
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      - N8N_WEBHOOK_URL
+      - N8N_WEBHOOK_WORKERS=3
+      - N8N_WEBHOOK_TIMEOUT=5
+      - MSSQL_SERVER
+      - MSSQL_DATABASE
+      - MSSQL_USER
+      - MSSQL_PASSWORD
+      - MSSQL_ODBC_DRIVER
+    network_mode: "host" # so the container can reach local network devices (Linux only)
+    volumes:
+      - ./:/app
+    stdin_open: true
+    tty: true
