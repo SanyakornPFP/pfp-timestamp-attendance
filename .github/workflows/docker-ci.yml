@@ -10,13 +10,31 @@ on:
 
 jobs:
   build-and-push:
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, iot-srv-docker, X64, Linux, docker-self-hosted]
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
-      - name: Log in to GitHub Container Registry (ghcr)
+      - name: Ensure Docker is available on runner
         run: |
-          echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+          echo "Checking docker availability..."
+          docker --version
+          docker info || true
+
+      - name: Log in to GitHub Container Registry (ghcr)
+        env:
+          GHCR_PAT: ${{ secrets.GHCR_PAT }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # prefer a provided GHCR PAT, otherwise use GITHUB_TOKEN
+          TOKEN="$GHCR_PAT"
+          if [ -z "$TOKEN" ]; then
+            TOKEN="$GITHUB_TOKEN"
+          fi
+          if [ -z "$TOKEN" ]; then
+            echo "ERROR: No GHCR token available (set secrets.GHCR_PAT or secrets.GITHUB_TOKEN)" >&2
+            exit 1
+          fi
+          echo "$TOKEN" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
 
       - name: Build Docker image
         run: |
