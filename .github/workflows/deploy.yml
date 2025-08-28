@@ -62,6 +62,14 @@ jobs:
           port: ${{ secrets.DEPLOY_PORT }}
           script: |
             set -e
+            # Login to registry on server using repo secrets (use token in DOCKER_PASSWORD)
+            REG="${{ secrets.DOCKER_REGISTRY }}"
+            if [ -z "$REG" ]; then
+              REG="docker.io"
+            fi
+            echo "Logging in to registry $REG as ${{ secrets.DOCKER_USERNAME }}"
+            echo "${{ secrets.DOCKER_PASSWORD }}" | docker login "$REG" -u "${{ secrets.DOCKER_USERNAME }}" --password-stdin || true
+
             # Pull latest and the exact digest we just pushed (ensures image matches by digest)
             echo "Pulling images: ${{ secrets.IMAGE_NAME }}:latest and ${{ secrets.IMAGE_NAME }}@${{ needs.build-and-push.outputs.image_digest }}"
             docker pull ${{ secrets.IMAGE_NAME }}:latest || true
