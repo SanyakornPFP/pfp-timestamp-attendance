@@ -12,13 +12,18 @@ RUN apt-get update \
        unixodbc-dev \
        gcc \
        g++ \
+       iputils-ping \
+       net-tools \
     && rm -rf /var/lib/apt/lists/*
 
 # (Optional) Install Microsoft ODBC Driver for SQL Server (linux) so pyodbc can connect to MSSQL
-# Note: uncomment the following block if you need MS ODBC support and you are running on a supported Debian/Ubuntu base
-RUN curl https://packages.microsoft.com/keys/microsoft.asc | apt-key add - \
-    && curl https://packages.microsoft.com/config/debian/11/prod.list > /etc/apt/sources.list.d/mssql-release.list \
-    && apt-get update && ACCEPT_EULA=Y apt-get install -y msodbcsql18
+# Use gpg --dearmor instead of the deprecated `apt-key` to avoid "command not found" (exit code 127)
+RUN set -eux; \
+    curl -fsSL https://packages.microsoft.com/keys/microsoft.asc | gpg --dearmor > /etc/apt/trusted.gpg.d/microsoft.gpg; \
+    curl -fsSL https://packages.microsoft.com/config/debian/11/prod.list -o /etc/apt/sources.list.d/mssql-release.list; \
+    apt-get update; \
+    ACCEPT_EULA=Y apt-get install -y msodbcsql18; \
+    rm -rf /var/lib/apt/lists/*
 
 # Create app directory
 WORKDIR /app

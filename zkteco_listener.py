@@ -209,11 +209,13 @@ def monitor_device(ip: str, name: str, poll_interval: float = 5.0):
                         # If already sequence-like, convert directly
                         if isinstance(r, (list, tuple)):
                             return tuple(r)
+
                         # Try common attribute names on Attendance-like objects
-                        attrs_user = ("user_id", "userid", "user", "uid", "id")
+                        attrs_user = ("user_id", "userid", "user", "uid", "id", "pin", "enroll_number", "badge", "card", "cardid")
                         attrs_time = ("timestamp", "time", "check_time", "datetime", "date_time")
                         u = None
                         t = None
+
                         for a in attrs_user:
                             u = getattr(r, a, None)
                             if u is not None:
@@ -222,20 +224,76 @@ def monitor_device(ip: str, name: str, poll_interval: float = 5.0):
                             t = getattr(r, a, None)
                             if t is not None:
                                 break
-                        # If object has a dict-like representation, try that
-                        if u is None and hasattr(r, "__dict__"):
+
+                        # If object has a dict-like representation, try that for missing values
+                        d = {}
+                        if hasattr(r, "__dict__"):
                             d = getattr(r, "__dict__", {}) or {}
-                            for a in attrs_user:
-                                if a in d and d[a] is not None:
-                                    u = d[a]
-                                    break
-                            for a in attrs_time:
-                                if a in d and d[a] is not None:
-                                    t = d[a]
-                                    break
-                        # Fallback: stringify the object
+                            if u is None:
+                                for a in attrs_user:
+                                    if a in d and d[a] is not None:
+                                        u = d[a]
+                                        break
+                            if t is None:
+                                for a in attrs_time:
+                                    if a in d and d[a] is not None:
+                                        t = d[a]
+                                        break
+
+                        # If we found a numeric userid, try to locate a string representation
+                        # that preserves leading zeros by inspecting dict values and repr
+                        try:
+                            if u is not None:
+                                # normalize bytes to str
+                                if isinstance(u, (bytes, bytearray)):
+                                    u = u.decode(errors="ignore")
+
+                                # If it's an int (or numeric string), look for a matching
+                                # string value elsewhere that contains leading zeros.
+                                numeric_val = None
+                                if isinstance(u, int):
+                                    numeric_val = u
+                                elif isinstance(u, str) and u.isdigit():
+                                    # keep string but also consider it numeric
+                                    numeric_val = int(u)
+
+                                if numeric_val is not None:
+                                    # search d values for a zero-padded string equal to numeric_val
+                                    for v in d.values():
+                                        if isinstance(v, (bytes, bytearray)):
+                                            try:
+                                                v = v.decode()
+                                            except Exception:
+                                                continue
+                                        if isinstance(v, str) and v.isdigit():
+                                            try:
+                                                if int(v) == numeric_val and (v.lstrip('0') != v or v == '0'):
+                                                    u = v
+                                                    break
+                                            except Exception:
+                                                continue
+
+                                    # if not found in dict, try to scan the string representation
+                                    if isinstance(u, (int,)) or (isinstance(u, str) and u.isdigit() and u == str(numeric_val)):
+                                        s = str(r)
+                                        # find digit substrings with leading zeros
+                                        import re
+                                        for m in re.finditer(r"\b0+\d+\b", s):
+                                            candidate = m.group(0)
+                                            try:
+                                                if int(candidate) == numeric_val:
+                                                    u = candidate
+                                                    break
+                                            except Exception:
+                                                continue
+                        except Exception:
+                            # be defensive: if anything goes wrong, fall back to original u
+                            pass
+
+                        # Fallback: stringify the object if nothing useful found
                         if u is None and t is None:
                             return (str(r),)
+
                         return (u, t) if t is not None else (u,)
 
                     try:

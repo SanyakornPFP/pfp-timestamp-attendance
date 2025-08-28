@@ -59,6 +59,24 @@ class DeviceRepository:
         password = os.getenv("MSSQL_PASSWORD")
         driver = os.getenv("MSSQL_ODBC_DRIVER")
 
+        # If the configured driver isn't available on the system, attempt to auto-select
+        # a known available MS ODBC driver. This helps when Docker image has msodbcsql18
+        # but .env was left as "ODBC Driver 17 for SQL Server".
+        try:
+            available = [d for d in pyodbc.drivers()]
+            if driver and driver not in available:
+                # prefer 18 then 17 if present
+                if "ODBC Driver 18 for SQL Server" in available:
+                    driver = "ODBC Driver 18 for SQL Server"
+                elif "ODBC Driver 17 for SQL Server" in available:
+                    driver = "ODBC Driver 17 for SQL Server"
+                else:
+                    # pick first available driver as last resort
+                    driver = available[0] if available else driver
+        except Exception:
+            # if pyodbc.drivers() fails for any reason, continue with configured driver
+            pass
+
         def make_conn_str(server, database, user, pw, driver):
             return f"DRIVER={{{driver}}};SERVER={server};DATABASE={database};UID={user};PWD={pw};TrustServerCertificate=yes;"
 
