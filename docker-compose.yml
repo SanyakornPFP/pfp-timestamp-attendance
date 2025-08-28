@@ -2,6 +2,7 @@ version: '3.8'
 services:
   zkteco-listener:
     build: .
+    image: pfp-timestamp-attendance:latest
     container_name: pfp-timestamp-attendance
     restart: unless-stopped
     env_file:
