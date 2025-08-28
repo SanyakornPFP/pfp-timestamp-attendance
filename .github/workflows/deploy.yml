@@ -18,7 +18,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Pre-flight: ensure required secrets
+      - name: 'Pre-flight: ensure required secrets'
         run: |
           if [ -z "${{ secrets.DOCKER_USERNAME }}" ] || [ -z "${{ secrets.DOCKER_PASSWORD }}" ] || [ -z "${{ secrets.IMAGE_NAME }}" ]; then
             echo "Missing required Docker secrets: DOCKER_USERNAME, DOCKER_PASSWORD or IMAGE_NAME" >&2
