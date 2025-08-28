@@ -14,6 +14,7 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       image: ${{ steps.meta.outputs.image }}
+      image_digest: ${{ steps.build.outputs.digest }}
     steps:
       - uses: actions/checkout@v4
 
@@ -42,7 +43,9 @@ jobs:
 
       - name: Set image output
         id: meta
-        run: echo "image=${{ secrets.IMAGE_NAME }}:${{ github.sha }}" >> $GITHUB_OUTPUT
+        run: |
+          echo "image=${{ secrets.IMAGE_NAME }}:${{ github.sha }}" >> $GITHUB_OUTPUT
+          echo "digest=${{ steps.build.outputs.digest }}" >> $GITHUB_OUTPUT
 
   deploy:
     name: Deploy to server (self-hosted iot-srv-docker)
@@ -59,10 +62,10 @@ jobs:
           port: ${{ secrets.DEPLOY_PORT }}
           script: |
             set -e
-            # Pull both latest (what your server uses) and the SHA-tagged image we also publish
-            echo "Pulling images: ${{ secrets.IMAGE_NAME }}:latest and ${{ secrets.IMAGE_NAME }}:${{ github.sha }}"
+            # Pull latest and the exact digest we just pushed (ensures image matches by digest)
+            echo "Pulling images: ${{ secrets.IMAGE_NAME }}:latest and ${{ secrets.IMAGE_NAME }}@${{ needs.build-and-push.outputs.image_digest }}"
             docker pull ${{ secrets.IMAGE_NAME }}:latest || true
-            docker pull ${{ secrets.IMAGE_NAME }}:${{ github.sha }} || true
+            docker pull ${{ secrets.IMAGE_NAME }}@${{ needs.build-and-push.outputs.image_digest }} || true
             # Optional: update a docker-compose setup in DEPLOY_PATH
             if [ -n "${{ secrets.DEPLOY_PATH }}" ]; then
               cd ${{ secrets.DEPLOY_PATH }}
