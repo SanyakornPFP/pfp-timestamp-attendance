@@ -15,6 +15,7 @@ services:
       - MSSQL_USER
       - MSSQL_PASSWORD
       - MSSQL_ODBC_DRIVER
+    network_mode: bridge
     volumes:
       - ./:/app
     stdin_open: true
