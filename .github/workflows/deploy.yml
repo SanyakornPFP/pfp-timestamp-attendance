@@ -59,16 +59,18 @@ jobs:
           port: ${{ secrets.DEPLOY_PORT }}
           script: |
             set -e
-            echo "Pulling image: ${{ secrets.IMAGE_NAME }}:${{ github.sha }}"
-            docker pull ${{ secrets.IMAGE_NAME }}:${{ github.sha }}
+            # Pull both latest (what your server uses) and the SHA-tagged image we also publish
+            echo "Pulling images: ${{ secrets.IMAGE_NAME }}:latest and ${{ secrets.IMAGE_NAME }}:${{ github.sha }}"
+            docker pull ${{ secrets.IMAGE_NAME }}:latest || true
+            docker pull ${{ secrets.IMAGE_NAME }}:${{ github.sha }} || true
             # Optional: update a docker-compose setup in DEPLOY_PATH
             if [ -n "${{ secrets.DEPLOY_PATH }}" ]; then
               cd ${{ secrets.DEPLOY_PATH }}
-              # If your docker-compose.yml references image:latest, you may want to update it or use the SHA tag.
+              # If your docker-compose.yml references image:latest, this will pull the new latest and restart
               docker compose pull || true
               docker compose up -d --remove-orphans
             else
-              echo "No DEPLOY_PATH specified; pulling image only"
+              echo "No DEPLOY_PATH specified; pulled images only"
             fi
 
       - name: Post-deploy sleep/check
