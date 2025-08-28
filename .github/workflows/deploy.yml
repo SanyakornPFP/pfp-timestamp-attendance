@@ -18,6 +18,13 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Pre-flight: ensure required secrets
+        run: |
+          if [ -z "${{ secrets.DOCKER_USERNAME }}" ] || [ -z "${{ secrets.DOCKER_PASSWORD }}" ] || [ -z "${{ secrets.IMAGE_NAME }}" ]; then
+            echo "Missing required Docker secrets: DOCKER_USERNAME, DOCKER_PASSWORD or IMAGE_NAME" >&2
+            exit 1
+          fi
+
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v2
 
@@ -80,8 +87,29 @@ jobs:
               # If your docker-compose.yml references image:latest, this will pull the new latest and restart
               docker compose pull || true
               docker compose up -d --remove-orphans
+
+              # Post-deploy: show images and digests available on server for the IMAGE_NAME
+              echo "Images for ${{ secrets.IMAGE_NAME }}:" 
+              docker images --digests | grep "${{ secrets.IMAGE_NAME }}" || true
+
+              # Show RepoDigest for latest and for the pushed digest (if present)
+              echo "RepoDigests for latest:"
+              docker image inspect --format='{{json .RepoDigests}}' "${{ secrets.IMAGE_NAME }}:latest" || true
+              echo "RepoDigests for digest tag:"
+              docker image inspect --format='{{json .RepoDigests}}' "${{ secrets.IMAGE_NAME }}@${{ needs.build-and-push.outputs.image_digest }}" || true
+
+              # Show running containers that use this image and their actual image id
+              echo "Running containers using ${{ secrets.IMAGE_NAME }} (if any):"
+              docker ps --filter "ancestor=${{ secrets.IMAGE_NAME }}" --format "{{.ID}} {{.Image}} {{.Names}} {{.Status}}" || true
+              for c in $(docker ps -q --filter "ancestor=${{ secrets.IMAGE_NAME }}"); do
+                echo "Container $c -> image id: $(docker inspect --format '{{.Image}}' $c)" || true
+              done
             else
               echo "No DEPLOY_PATH specified; pulled images only"
+              # Still show images/digests pulled
+              echo "Images for ${{ secrets.IMAGE_NAME }} on server:" 
+              docker images --digests | grep "${{ secrets.IMAGE_NAME }}" || true
+              docker image inspect --format='{{json .RepoDigests}}' "${{ secrets.IMAGE_NAME }}@${{ needs.build-and-push.outputs.image_digest }}" || true
             fi
 
       - name: Post-deploy sleep/check
