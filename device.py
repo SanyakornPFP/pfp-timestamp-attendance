@@ -71,7 +71,7 @@ class DeviceRepository:
                 elif "ODBC Driver 17 for SQL Server" in available:
                     driver = "ODBC Driver 17 for SQL Server"
                 else:
-                    # pick first available driver as last resort (usually "SQL Server")
+                    # pick first available driver as last resort
                     driver = available[0] if available else driver
         except Exception:
             # if pyodbc.drivers() fails for any reason, continue with configured driver
