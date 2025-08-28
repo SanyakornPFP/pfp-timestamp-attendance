@@ -15,7 +15,6 @@ services:
       - MSSQL_USER
       - MSSQL_PASSWORD
       - MSSQL_ODBC_DRIVER
-    network_mode: "host" # so the container can reach local network devices (Linux only)
     volumes:
       - ./:/app
     stdin_open: true

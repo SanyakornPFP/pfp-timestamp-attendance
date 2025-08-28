@@ -43,10 +43,7 @@ except Exception:
 
 # Webhook queue + worker to reuse connections and avoid ephemeral port exhaustion
 _WEBHOOK_URL = os.environ.get(
-    "N8N_WEBHOOK_URL",
-    # "https://n8n.pfpintranet.com/webhook-test/c70ded1f-e6e4-4cb2-8038-4407e733a546", #Tester
-    "https://n8n.pfpintranet.com/webhook/c70ded1f-e6e4-4cb2-8038-4407e733a546", #Production
-    
+    "N8N_WEBHOOK_URL"
 )
 _webhook_q: Queue = Queue()
 _WEBHOOK_WORKERS = int(os.environ.get("N8N_WEBHOOK_WORKERS", "3"))

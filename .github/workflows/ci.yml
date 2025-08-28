@@ -1,0 +1,75 @@
+name: CI
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  ubuntu:
+    name: Ubuntu CI
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+
+      - name: Install requirements (if any)
+        run: |
+          if [ -f requirements.txt ]; then
+            python -m pip install --upgrade pip
+            python -m pip install -r requirements.txt || true
+          else
+            echo "No requirements.txt found, skipping"
+          fi
+
+      - name: Compile Python files (syntax check)
+        run: |
+          set -e
+          files=$(git ls-files '*.py')
+          if [ -z "$files" ]; then
+            echo "No python files found"
+          else
+            for f in $files; do
+              echo "Compiling $f"
+              python -m py_compile "$f"
+            done
+          fi
+
+  self-hosted-linux:
+    name: Self-hosted CI (iot-srv-docker)
+    # Targets a self-hosted Linux x86_64 runner labeled 'iot-srv-docker'
+    runs-on: [self-hosted, iot-srv-docker]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+
+      - name: Install requirements (self-hosted Linux)
+        run: |
+          if [ -f requirements.txt ]; then
+            python -m pip install --upgrade pip
+            python -m pip install -r requirements.txt || true
+          else
+            echo "No requirements.txt found, skipping"
+          fi
+
+      - name: Compile Python files (syntax check) (self-hosted)
+        run: |
+          set -e
+          files=$(git ls-files '*.py')
+          if [ -z "$files" ]; then
+            echo "No python files found"
+          else
+            for f in $files; do
+              echo "Compiling $f"
+              python -m py_compile "$f"
+            done
+          fi

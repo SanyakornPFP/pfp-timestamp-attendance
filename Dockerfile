@@ -35,7 +35,8 @@ COPY . /app
 RUN pip install --no-cache-dir -r requirements.txt
 
 # Default environment variables (can be overridden at runtime)
-ENV N8N_WEBHOOK_URL="https://n8n.pfpintranet.com/webhook-test/c70ded1f-e6e4-4cb2-8038-4407e733a546"
+ENV N8N_WEBHOOK_URL="https://n8n.pfpintranet.com/webhook/c70ded1f-e6e4-4cb2-8038-4407e733a546"
+# ENV N8N_WEBHOOK_URL="https://n8n.pfpintranet.com/webhook-test/c70ded1f-e6e4-4cb2-8038-4407e733a546"
 ENV N8N_WEBHOOK_WORKERS=3
 ENV N8N_WEBHOOK_TIMEOUT=5
 
