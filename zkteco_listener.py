@@ -1,12 +1,9 @@
 """Continuously monitor ZKTeco devices and print scanned user IDs.
-
 This script polls each device (port 4370) using the `zk` Python package.
 It keeps a small in-memory set of already-seen attendance records and prints
 only new user IDs as they appear.
-
 Requirements:
   pip install pyzk
-
 Run:
   python zkteco_listener.py
 """
@@ -73,13 +70,13 @@ def _webhook_worker():
             try:
                 if _session:
                     resp = _session.post(_WEBHOOK_URL, json=payload, headers=headers, timeout=_WEBHOOK_TIMEOUT)
-                    logger.info("Webhook %s -> status=%s", _WEBHOOK_URL, getattr(resp, "status_code", None))
+                    # logger.info("Webhook %s -> status=%s", _WEBHOOK_URL, getattr(resp, "status_code", None))
                 else:
                     data = json.dumps(payload).encode("utf-8")
                     req = urllib.request.Request(_WEBHOOK_URL, data=data, headers=headers, method="POST")
                     with urllib.request.urlopen(req, timeout=_WEBHOOK_TIMEOUT) as r:
                         status = getattr(r, "status", None)
-                        logger.info("Webhook %s -> status=%s", _WEBHOOK_URL, status)
+                        # logger.info("Webhook %s -> status=%s", _WEBHOOK_URL, status)
                 break
             except Exception as e:
                 attempt += 1
@@ -276,7 +273,7 @@ def monitor_device(ip: str, name: str, poll_interval: float = 5.0):
                                         s = str(r)
                                         # find digit substrings with leading zeros
                                         import re
-                                        for m in re.finditer(r"\b0+\d+\b", s):
+                                        for m in re.finditer(r"0+\d+", s):
                                             candidate = m.group(0)
                                             try:
                                                 if int(candidate) == numeric_val:
@@ -303,7 +300,81 @@ def monitor_device(ip: str, name: str, poll_interval: float = 5.0):
                     key = tuple(map(str, tup))
                     if key not in seen:
                         seen.add(key)
-                        userid = str(tup[0]) if len(tup) > 0 else ""
+
+                        # Preserve leading zeros for user ids when possible.
+                        # If the normalized value is an int, try to find a
+                        # zero-padded string in the original record's dict
+                        # or string representation; otherwise fall back to str().
+                        def _format_userid(u, original_rec):
+                            try:
+                                # normalize bytes -> str
+                                if isinstance(u, (bytes, bytearray)):
+                                    u = u.decode(errors="ignore")
+
+                                # Helper to search for a zero-padded string matching numeric_val
+                                def _search_zero_padded(numeric_val):
+                                    d = {}
+                                    if hasattr(original_rec, "__dict__"):
+                                        d = getattr(original_rec, "__dict__", {}) or {}
+                                    for v in d.values():
+                                        if isinstance(v, (bytes, bytearray)):
+                                            try:
+                                                v = v.decode()
+                                            except Exception:
+                                                continue
+                                        if isinstance(v, str) and v.isdigit():
+                                            try:
+                                                if int(v) == numeric_val and (v.lstrip("0") != v or v == "0"):
+                                                    return v
+                                            except Exception:
+                                                continue
+                                    # Fallback: scan string repr for zero-padded digit substrings
+                                    import re
+                                    s = str(original_rec)
+                                    for m in re.finditer(r"0+\d+", s):
+                                        candidate = m.group(0)
+                                        try:
+                                            if int(candidate) == numeric_val:
+                                                return candidate
+                                        except Exception:
+                                            continue
+                                    return None
+
+                                # if string
+                                if isinstance(u, str):
+                                    # numeric string -> try to find zero-padded variant
+                                    if u.isdigit():
+                                        try:
+                                            numeric_val = int(u)
+                                        except Exception:
+                                            return u
+                                        found = _search_zero_padded(numeric_val)
+                                        return found if found is not None else u
+                                    # non-numeric string -> return as-is
+                                    return u
+
+                                # if int -> search for zero-padded variant
+                                if isinstance(u, int):
+                                    found = _search_zero_padded(u)
+                                    return found if found is not None else str(u)
+
+                                # fallback for other types
+                                return str(u) if u is not None else ""
+                            except Exception:
+                                return str(u) if u is not None else ""
+
+                        userid = _format_userid(tup[0], rec) if len(tup) > 0 else ""
+                        # If userid is shorter than 5 characters, pad with leading zeros
+                        try:
+                            if userid is not None:
+                                s = str(userid)
+                                if len(s) < 5:
+                                    userid = s.zfill(5)
+                                else:
+                                    userid = s
+                        except Exception:
+                            userid = str(userid) if userid is not None else ""
+
                         ts = str(tup[1]) if len(tup) > 1 else ""
                         msg = f"{ip} [{name}] scanned user: {userid} at {ts}"
                         print(msg)
@@ -359,7 +430,6 @@ def main():
             time.sleep(1)
     except KeyboardInterrupt:
         logger.info("Shutting down listener")
-
 
 if __name__ == "__main__":
     main()
