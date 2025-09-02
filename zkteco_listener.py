@@ -1,7 +1,7 @@
 """Continuously monitor ZKTeco devices and print scanned user IDs.
 This script polls each device (port 4370) using the `zk` Python package.
 It keeps a small in-memory set of already-seen attendance records and prints
-only new user IDs as they appear.
+only new user IDs as they appear.                                            
 Requirements:
   pip install pyzk
 Run:
@@ -170,12 +170,12 @@ def monitor_device(ip: str, name: str, poll_interval: float = 5.0):
             # Optional: Sync time or disable device while reading
             while True:
                 try:
-                    records = conn.get_attendance()
+                    records = conn.live_capture()
                 except Exception as e:
                     # Log specific network/timeouts from the ZK library or socket
                     try:
                         if hasattr(zk_module, 'exception') and isinstance(e, zk_module.exception.ZKNetworkError):
-                            logger.warning("Device %s (%s) network error during get_attendance: %s", ip, name, e)
+                            logger.warning("Device %s (%s) network error during live_capture: %s", ip, name, e)
                         elif isinstance(e, (socket.timeout, TimeoutError)):
                             logger.warning("Timeout reading attendance from %s (%s): %s", ip, name, e)
                         else:
