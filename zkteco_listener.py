@@ -24,6 +24,29 @@ from device import fetch_initial_devices
 logger = logging.getLogger("zkteco_listener")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 
+# enable faulthandler to dump Python tracebacks on deadlocks/crashes
+import faulthandler
+faulthandler.enable()
+
+# heartbeat + seen-prune configuration (overridable via env)
+_HEARTBEAT_INTERVAL = int(os.environ.get("HEARTBEAT_INTERVAL", "60"))
+_SEEN_PRUNE_INTERVAL = int(os.environ.get("SEEN_PRUNE_INTERVAL", "300"))
+_SEEN_MAX_AGE = int(os.environ.get("SEEN_MAX_AGE", "3600"))
+_SEEN_MAX_SIZE = int(os.environ.get("SEEN_MAX_SIZE", "20000"))
+
+def _heartbeat():
+    hlogger = logging.getLogger("zkteco_listener")
+    while True:
+        try:
+            hlogger.info("heartbeat: process alive")
+        except Exception:
+            pass
+        time.sleep(_HEARTBEAT_INTERVAL)
+
+# start heartbeat thread
+_hb_thread = threading.Thread(target=_heartbeat, daemon=True)
+_hb_thread.start()
+
 
 try:
     import zk as zk_module
@@ -41,7 +64,8 @@ except Exception:
 # Webhook queue + worker to reuse connections and avoid ephemeral port exhaustion
 _WEBHOOK_URL = os.environ.get(
     "N8N_WEBHOOK_URL",
-    "https://n8n.pfpintranet.com/webhook/c70ded1f-e6e4-4cb2-8038-4407e733a546"
+    # "https://n8n.pfpintranet.com/webhook/c70ded1f-e6e4-4cb2-8038-4407e733a546"
+    "https://n8n.pfpintranet.com/webhook-test/c70ded1f-e6e4-4cb2-8038-4407e733a546"
 )
 _webhook_q: Queue = Queue()
 _WEBHOOK_WORKERS = int(os.environ.get("N8N_WEBHOOK_WORKERS", "3"))
@@ -97,7 +121,6 @@ def enqueue_webhook(ip: str, name: str, userid: str, ts: str) -> None:
         _webhook_q.put_nowait((ip, name, userid, ts))
     except Exception as e:
         logger.warning("Failed to enqueue webhook for %s: %s", ip, e)
-
 
 def is_timestamp_today(ts: str) -> bool:
     """Return True if the provided timestamp string represents today's date.
@@ -158,14 +181,25 @@ def is_timestamp_today(ts: str) -> bool:
 
 
 def monitor_device(ip: str, name: str, poll_interval: float = 5.0):
-    """Connect to a device and poll attendance logs, printing new userids."""
-    seen: Set[Tuple] = set()
+    """Connect to a device and poll attendance logs, printing new userids.
+
+    Use a timestamped `seen` dict and prune it periodically to prevent
+    unbounded memory growth when running long-lived in Docker.
+    """
+    seen = {}  # key_str -> last_seen_timestamp
+    _last_prune = time.time()
+    # reconnect backoff (exponential) to avoid tight reconnect loops
+    reconnect_backoff = 1.0
+    reconnect_backoff_max = 60.0
+
     while True:
         zk = None
         conn = None
         try:
             zk = ZK(ip, port=4370, timeout=5)
             conn = zk.connect()
+            # connected: reset backoff
+            reconnect_backoff = 1.0
             # logger.info("Connected to device %s (%s)", ip, name)
             # Optional: Sync time or disable device while reading
             while True:
@@ -199,6 +233,22 @@ def monitor_device(ip: str, name: str, poll_interval: float = 5.0):
                     rec_iter = [records]
 
                 for rec in rec_iter:
+                    # protect processing of an individual record so a
+                    # malformed record doesn't kill the whole device loop
+                    try:
+                        # Normalize record into a tuple-like sequence (user, ts, ...)
+                        
+                        
+                        
+                        
+                        
+                        pass
+                    except Exception as _rec_err:
+                        logger.warning("Skipping bad record from %s (%s): %s", ip, name, _rec_err)
+                        # continue to next record
+                        continue
+
+                    # --- actual processing continues below ---
                     # Normalize record into a tuple-like sequence (user, ts, ...)
                     def record_to_tuple(r):
                         # If already sequence-like, convert directly
@@ -298,8 +348,28 @@ def monitor_device(ip: str, name: str, poll_interval: float = 5.0):
                         tup = (str(rec),)
 
                     key = tuple(map(str, tup))
-                    if key not in seen:
-                        seen.add(key)
+                    key_str = "\x1f".join(key)
+
+                    # periodic pruning
+                    now = time.time()
+                    if now - _last_prune >= _SEEN_PRUNE_INTERVAL:
+                        try:
+                            cutoff = now - _SEEN_MAX_AGE
+                            # remove old entries
+                            old = [k for k, ts in seen.items() if ts < cutoff]
+                            for k in old:
+                                seen.pop(k, None)
+                            # trim if still too large
+                            if len(seen) > _SEEN_MAX_SIZE:
+                                items = sorted(seen.items(), key=lambda kv: kv[1], reverse=True)[:_SEEN_MAX_SIZE]
+                                seen = dict(items)
+                            logger.debug("pruned seen cache, size=%d", len(seen))
+                        except Exception:
+                            logger.exception("Error pruning seen cache")
+                        _last_prune = now
+
+                    if key_str not in seen:
+                        seen[key_str] = now
 
                         # Preserve leading zeros for user ids when possible.
                         # If the normalized value is an int, try to find a
@@ -364,16 +434,66 @@ def monitor_device(ip: str, name: str, poll_interval: float = 5.0):
                                 return str(u) if u is not None else ""
 
                         userid = _format_userid(tup[0], rec) if len(tup) > 0 else ""
-                        # If userid is shorter than 5 characters, pad with leading zeros
+
+                        # Robust fallback extraction: if userid is empty or appears
+                        # invalid, scan other tup elements, rec.__dict__ and str(rec)
+                        # to find the best numeric candidate (prefer longest match).
                         try:
-                            if userid is not None:
-                                s = str(userid)
-                                if len(s) < 5:
-                                    userid = s.zfill(5)
-                                else:
-                                    userid = s
+                            if userid is None:
+                                userid = ""
+                            s0 = str(userid).strip()
+                            if s0.lower() == "none" or s0 == "":
+                                userid = ""
+
+                            def _best_digit_from_string(s):
+                                import re
+                                best = None
+                                for m in re.finditer(r"\d+", s or ""):
+                                    cand = m.group(0)
+                                    if best is None or len(cand) > len(best):
+                                        best = cand
+                                return best
+
+                            # if we already have a digit candidate, prefer it
+                            if userid:
+                                best = _best_digit_from_string(str(userid))
+                                if best:
+                                    userid = best.zfill(5) if len(best) < 5 else best
+                            # try tup elements
+                            if not userid:
+                                for v in tup:
+                                    try:
+                                        vs = str(v)
+                                    except Exception:
+                                        continue
+                                    best = _best_digit_from_string(vs)
+                                    if best:
+                                        userid = best.zfill(5) if len(best) < 5 else best
+                                        break
+                            # try record dict
+                            if not userid and hasattr(rec, "__dict__"):
+                                for v in (getattr(rec, "__dict__", {}) or {}).values():
+                                    try:
+                                        vs = str(v)
+                                    except Exception:
+                                        continue
+                                    best = _best_digit_from_string(vs)
+                                    if best:
+                                        userid = best.zfill(5) if len(best) < 5 else best
+                                        break
+                            # last resort: scan string representation of rec
+                            if not userid:
+                                best = _best_digit_from_string(str(rec))
+                                if best:
+                                    userid = best.zfill(5) if len(best) < 5 else best
+
+                            # keep non-numeric string as-is (no padding) if nothing numeric found
                         except Exception:
                             userid = str(userid) if userid is not None else ""
+
+                        # Log when userid ended up empty to aid debugging
+                        if not userid:
+                            logger.debug("Empty userid for device %s (%s) — rec=%r tup=%r", ip, name, rec, tup)
 
                         ts = str(tup[1]) if len(tup) > 1 else ""
                         msg = f"{ip} [{name}] scanned user: {userid} at {ts}"
@@ -408,8 +528,14 @@ def monitor_device(ip: str, name: str, poll_interval: float = 5.0):
                     conn.disconnect()
             except Exception:
                 pass
-        # Wait before reconnecting
-        time.sleep(3)
+        # Wait before reconnecting (exponential backoff)
+        try:
+            logger.info("Reconnecting to %s (%s) after %.1fs", ip, name, reconnect_backoff)
+            time.sleep(reconnect_backoff)
+        except Exception:
+            time.sleep(3)
+        # increase backoff for next attempt, capped
+        reconnect_backoff = min(reconnect_backoff * 2, reconnect_backoff_max)
 
 
 def main():
