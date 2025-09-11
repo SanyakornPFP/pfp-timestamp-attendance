@@ -52,59 +52,47 @@ class DeviceRepository:
 
         Returns list of Device objects (may be empty on error).
         """
-        # build connection string from environment (same style as test_connection.py)
-        server = os.getenv("MSSQL_SERVER")
-        database = os.getenv("MSSQL_DATABASE")
-        username = os.getenv("MSSQL_USER")
-        password = os.getenv("MSSQL_PASSWORD")
-        driver = os.getenv("MSSQL_ODBC_DRIVER")
+        # Custom static list of device IPs provided by the user.
+        ips = [
+            "192.168.3.246",
+            "192.168.3.227",
+            "192.168.3.231",
+            "192.168.3.229",
+            "192.168.3.243",
+            "192.168.3.232",
+            "192.168.3.238",
+            "192.168.3.244",
+            "192.168.3.218",
+            "192.168.3.225",
+            "192.168.3.241",
+            "192.168.3.249",
+            "192.168.3.251",
+            "192.168.3.213",
+            "192.168.3.222",
+            "192.168.3.239",
+            # "192.168.3.220",
+            "192.168.3.233",
+            # "192.168.3.225",  # duplicate in source list
+            "192.168.3.221",
+            "192.168.3.226",
+            # "192.168.3.219",
+            "192.168.3.247",
+            "192.168.3.245",
+            "192.168.3.248",
+            # "192.168.3.214",
+        ]
 
-        # If the configured driver isn't available on the system, attempt to auto-select
-        # a known available MS ODBC driver. This helps when Docker image has msodbcsql18
-        # but .env was left as "ODBC Driver 17 for SQL Server".
-        try:
-            available = [d for d in pyodbc.drivers()]
-            if driver and driver not in available:
-                # prefer 18 then 17 if present
-                if "ODBC Driver 18 for SQL Server" in available:
-                    driver = "ODBC Driver 18 for SQL Server"
-                elif "ODBC Driver 17 for SQL Server" in available:
-                    driver = "ODBC Driver 17 for SQL Server"
-                else:
-                    # pick first available driver as last resort (usually "SQL Server")
-                    driver = available[0] if available else driver
-        except Exception:
-            # if pyodbc.drivers() fails for any reason, continue with configured driver
-            pass
+        # Deduplicate while preserving order
+        seen = set()
+        devices: List[Device] = []
+        for ip in ips:
+            if ip in seen:
+                continue
+            seen.add(ip)
+            devices.append(Device(ip=ip, name=ip))
 
-        def make_conn_str(server, database, user, pw, driver):
-            return f"DRIVER={{{driver}}};SERVER={server};DATABASE={database};UID={user};PWD={pw};TrustServerCertificate=yes;"
-
-        conn = None
-        cursor = None
-        try:
-            conn_str = make_conn_str(server, os.getenv("MSSQL_DATABASE"), username, password, driver)
-            conn = pyodbc.connect(conn_str, timeout=5)
-            cursor = conn.cursor()
-            select_query = "SELECT [IP],[DeviceName] FROM [EmpBook_db].[dbo].[Device] WITH (NOLOCK) WHERE [Flag] = 1"
-            cursor.execute(select_query)
-            rows = cursor.fetchall()
-            self.device_info = Device.sqlToModel(rows)
-            return self.device_info
-        except Exception as e:
-            logger.exception("equipment Error: %s", e)
-            return []
-        finally:
-            try:
-                if cursor:
-                    cursor.close()
-            except Exception:
-                pass
-            try:
-                if conn:
-                    conn.close()
-            except Exception:
-                pass
+        self.device_info = devices
+        return devices
 
 
 def fetch_initial_devices() -> List[Device]:

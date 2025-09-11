@@ -50,8 +50,8 @@ except Exception:
 # Webhook queue + worker to reuse connections and avoid ephemeral port exhaustion
 _WEBHOOK_URL = os.environ.get(
     "N8N_WEBHOOK_URL",
-    # "https://n8n.pfpintranet.com/webhook/c70ded1f-e6e4-4cb2-8038-4407e733a546"
-    "https://n8n.pfpintranet.com/webhook-test/c70ded1f-e6e4-4cb2-8038-4407e733a546"
+    "https://n8n.pfpintranet.com/webhook/c70ded1f-e6e4-4cb2-8038-4407e733a546"
+    # "https://n8n.pfpintranet.com/webhook-test/c70ded1f-e6e4-4cb2-8038-4407e733a546"
 )
 _webhook_q: Queue = Queue()
 _WEBHOOK_WORKERS = int(os.environ.get("N8N_WEBHOOK_WORKERS", "3"))
@@ -472,11 +472,22 @@ def monitor_device(ip: str, name: str, poll_interval: float = 5.0):
                         except Exception:
                             userid = str(userid) if userid is not None else ""
 
-                        # Log when userid ended up empty to aid debugging
-                        if not userid:
-                            logger.debug("Empty userid for device %s (%s) — rec=%r tup=%r", ip, name, rec, tup)
-
+                        # If userid or timestamp are empty, skip printing/enqueueing
                         ts = str(tup[1]) if len(tup) > 1 else ""
+                        if not userid or not ts:
+                            # Keep a debug trace so we can diagnose malformed records,
+                            # but avoid noisy printed lines like: "scanned user:  at "
+                            logger.debug(
+                                "Skipping record without userid or timestamp for device %s (%s) — userid=%r ts=%r rec=%r tup=%r",
+                                ip,
+                                name,
+                                userid,
+                                ts,
+                                rec,
+                                tup,
+                            )
+                            continue
+
                         msg = f"{ip} [{name}] scanned user: {userid} at {ts}"
                         print(msg)
                         # Only enqueue webhook if timestamp is today
