@@ -50,8 +50,8 @@ except Exception:
 # Webhook queue + worker to reuse connections and avoid ephemeral port exhaustion
 _WEBHOOK_URL = os.environ.get(
     "N8N_WEBHOOK_URL",
-    "https://n8n.pfpintranet.com/webhook/c70ded1f-e6e4-4cb2-8038-4407e733a546"
-    # "https://n8n.pfpintranet.com/webhook-test/c70ded1f-e6e4-4cb2-8038-4407e733a546"
+    # "https://n8n.pfpintranet.com/webhook/c70ded1f-e6e4-4cb2-8038-4407e733a546"
+    "https://n8n.pfpintranet.com/webhook-test/c70ded1f-e6e4-4cb2-8038-4407e733a546"
 )
 _webhook_q: Queue = Queue()
 _WEBHOOK_WORKERS = int(os.environ.get("N8N_WEBHOOK_WORKERS", "3"))
@@ -192,17 +192,36 @@ def monitor_device(ip: str, name: str, poll_interval: float = 5.0):
                 try:
                     records = conn.live_capture()
                 except Exception as e:
-                    # Log specific network/timeouts from the ZK library or socket
+                    # If the device does not support RWB (read-with-buffer) some
+                    # devices will raise a ZKErrorResponse("RWB Not supported").
+                    # In that case try a more compatible fallback: pull the
+                    # attendance list with `get_attendance()` if available.
                     try:
-                        if hasattr(zk_module, 'exception') and isinstance(e, zk_module.exception.ZKNetworkError):
-                            logger.warning("Device %s (%s) network error during get_attendance: %s", ip, name, e)
-                        elif isinstance(e, (socket.timeout, TimeoutError)):
-                            logger.warning("Timeout reading attendance from %s (%s): %s", ip, name, e)
+                        if hasattr(zk_module, 'exception') and isinstance(e, zk_module.exception.ZKErrorResponse) and "RWB Not supported" in str(e):
+                            logger.warning("Device %s (%s) reported RWB not supported — falling back to get_attendance()", ip, name)
+                            try:
+                                # Some ZK implementations expose get_attendance()
+                                # which returns a list of attendance records.
+                                if hasattr(conn, 'get_attendance'):
+                                    records = conn.get_attendance()
+                                elif hasattr(conn, 'get_attendance_data'):
+                                    records = conn.get_attendance_data()
+                                else:
+                                    raise AttributeError("no get_attendance fallback on conn")
+                            except Exception as fb_e:
+                                logger.exception("Fallback attendance read failed for %s (%s): %s", ip, name, fb_e)
+                                break
                         else:
-                            logger.debug("get_attendance failed for %s (%s): %s", ip, name, e)
+                            # Log specific network/timeouts from the ZK library or socket
+                            if hasattr(zk_module, 'exception') and isinstance(e, zk_module.exception.ZKNetworkError):
+                                logger.warning("Device %s (%s) network error during get_attendance: %s", ip, name, e)
+                            elif isinstance(e, (socket.timeout, TimeoutError)):
+                                logger.warning("Timeout reading attendance from %s (%s): %s", ip, name, e)
+                            else:
+                                logger.debug("get_attendance failed for %s (%s): %s", ip, name, e)
                     except Exception:
                         logger.debug("get_attendance exception for %s (%s): %s", ip, name, e)
-                    break
+                        break
 
                 # Some drivers return a list of tuples/rows, others a single
                 # Attendance object. Normalize into an iterable of record-like
