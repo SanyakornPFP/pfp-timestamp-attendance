@@ -28,24 +28,10 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(me
 import faulthandler
 faulthandler.enable()
 
-# heartbeat + seen-prune configuration (overridable via env)
-_HEARTBEAT_INTERVAL = int(os.environ.get("HEARTBEAT_INTERVAL", "60"))
+# seen-prune configuration (overridable via env)
 _SEEN_PRUNE_INTERVAL = int(os.environ.get("SEEN_PRUNE_INTERVAL", "300"))
 _SEEN_MAX_AGE = int(os.environ.get("SEEN_MAX_AGE", "3600"))
 _SEEN_MAX_SIZE = int(os.environ.get("SEEN_MAX_SIZE", "20000"))
-
-def _heartbeat():
-    hlogger = logging.getLogger("zkteco_listener")
-    while True:
-        try:
-            hlogger.info("heartbeat: process alive")
-        except Exception:
-            pass
-        time.sleep(_HEARTBEAT_INTERVAL)
-
-# start heartbeat thread
-_hb_thread = threading.Thread(target=_heartbeat, daemon=True)
-_hb_thread.start()
 
 
 try:
@@ -204,7 +190,7 @@ def monitor_device(ip: str, name: str, poll_interval: float = 5.0):
             # Optional: Sync time or disable device while reading
             while True:
                 try:
-                    records = conn.get_attendance()
+                    records = conn.live_capture()
                 except Exception as e:
                     # Log specific network/timeouts from the ZK library or socket
                     try:
@@ -237,11 +223,6 @@ def monitor_device(ip: str, name: str, poll_interval: float = 5.0):
                     # malformed record doesn't kill the whole device loop
                     try:
                         # Normalize record into a tuple-like sequence (user, ts, ...)
-                        
-                        
-                        
-                        
-                        
                         pass
                     except Exception as _rec_err:
                         logger.warning("Skipping bad record from %s (%s): %s", ip, name, _rec_err)
