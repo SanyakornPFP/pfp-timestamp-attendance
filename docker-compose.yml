@@ -2,15 +2,12 @@ version: '3.8'
 services:
   zkteco-listener:
     build: .
-    image: pfp-timestamp-attendance:latest
-    container_name: pfp-timestamp-attendance
+    image: timestamp-attendance:latest
+    container_name: timestamp-attendance
     restart: unless-stopped
     env_file:
       - .env
     environment:
-      - N8N_WEBHOOK_URL
-      - N8N_WEBHOOK_WORKERS=3
-      - N8N_WEBHOOK_TIMEOUT=5
       - MSSQL_SERVER
       - MSSQL_DATABASE
       - MSSQL_USER

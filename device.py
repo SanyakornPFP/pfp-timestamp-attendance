@@ -52,47 +52,98 @@ class DeviceRepository:
 
         Returns list of Device objects (may be empty on error).
         """
-        # Custom static list of device IPs provided by the user.
-        ips = [
-            "192.168.3.246",
-            "192.168.3.227",
-            "192.168.3.231",
-            "192.168.3.229",
-            "192.168.3.243",
-            "192.168.3.232",
-            "192.168.3.238",
-            "192.168.3.244",
-            "192.168.3.218",
-            "192.168.3.225",
-            "192.168.3.241",
-            "192.168.3.249",
-            "192.168.3.251",
-            "192.168.3.213",
-            "192.168.3.222",
-            "192.168.3.239",
-            # "192.168.3.220",
-            "192.168.3.233",
-            # "192.168.3.225",  # duplicate in source list
-            "192.168.3.221",
-            "192.168.3.226",
-            # "192.168.3.219",
-            "192.168.3.247",
-            "192.168.3.245",
-            "192.168.3.248",
-            # "192.168.3.214",
-        ]
+        # build connection string from environment (same style as test_connection.py)
+        server = os.getenv("MSSQL_SERVER")
+        database = os.getenv("MSSQL_DATABASE")
+        username = os.getenv("MSSQL_USER")
+        password = os.getenv("MSSQL_PASSWORD")
+        env_driver = os.getenv("MSSQL_ODBC_DRIVER")
 
-        # Deduplicate while preserving order
-        seen = set()
-        devices: List[Device] = []
-        for ip in ips:
-            if ip in seen:
-                continue
-            seen.add(ip)
-            devices.append(Device(ip=ip, name=ip))
+        def make_conn_str(server, database, user, pw, driver):
+            return f"DRIVER={{{driver}}};SERVER={server};DATABASE={database};UID={user};PWD={pw};TrustServerCertificate=yes;"
 
-        self.device_info = devices
-        return devices
+        # helper: mask password for logging
+        def masked_conn_str(driver):
+            masked_pw = "***" if password else ""
+            return f"DRIVER={{{driver}}};SERVER={server};DATABASE={database};UID={username};PWD={masked_pw};"
+
+        conn = None
+        cursor = None
+        try:
+            # Validate required env vars
+            missing = [name for name, val in (('MSSQL_SERVER', server), ('MSSQL_DATABASE', database), ('MSSQL_USER', username), ('MSSQL_PASSWORD', password)) if not val]
+            if missing:
+                logger.error("Missing required MSSQL environment variables: %s", ",".join(missing))
+                return []
+
+            # Detect installed ODBC drivers and pick a suitable SQL Server driver
+            available_drivers = [d for d in pyodbc.drivers() if d and d.strip()]
+            logger.debug("Available ODBC drivers: %s", available_drivers)
+
+            preferred_drivers = []
+            if env_driver:
+                preferred_drivers.append(env_driver)
+            # common Microsoft drivers in descending preference
+            preferred_drivers.extend([
+                'ODBC Driver 18 for SQL Server',
+                'ODBC Driver 17 for SQL Server',
+                'ODBC Driver 13 for SQL Server',
+                'SQL Server Native Client 11.0',
+                'SQL Server'
+            ])
+
+            chosen_driver = None
+            for d in preferred_drivers:
+                if d in available_drivers:
+                    chosen_driver = d
+                    break
+
+            if not chosen_driver:
+                logger.error("No suitable ODBC driver found. Available drivers: %s. Please install Microsoft ODBC Driver for SQL Server and/or set MSSQL_ODBC_DRIVER in your environment.", available_drivers)
+                return []
+
+            conn_str = make_conn_str(server, database, username, password, chosen_driver)
+            logger.info("Connecting to DB using driver '%s' — %s", chosen_driver, masked_conn_str(chosen_driver))
+
+            # small retry loop for transient issues
+            last_exc = None
+            for attempt in range(1, 3):
+                try:
+                    conn = pyodbc.connect(conn_str, timeout=5)
+                    break
+                except Exception as e:
+                    logger.warning("DB connect attempt %d failed: %s", attempt, e)
+                    last_exc = e
+                    if attempt < 2:
+                        import time
+                        time.sleep(1)
+            else:
+                # all attempts failed
+                raise last_exc
+            cursor = conn.cursor()
+            select_query = "SELECT [IP],[DeviceName] FROM [EmpBook_db].[dbo].[Device] WITH (NOLOCK) WHERE [Flag] = 1"
+            cursor.execute(select_query)
+            rows = cursor.fetchall()
+            self.device_info = Device.sqlToModel(rows)
+            return self.device_info
+        except Exception as e:
+            # log the exception with guidance for IM002 driver errors
+            if isinstance(e, pyodbc.InterfaceError) or (hasattr(e, 'args') and e.args and 'IM002' in str(e.args[0])):
+                logger.exception("equipment Error (ODBC driver issue): %s — Available drivers: %s. Recommend installing Microsoft ODBC Driver for SQL Server or setting MSSQL_ODBC_DRIVER environment variable.", e, pyodbc.drivers())
+            else:
+                logger.exception("equipment Error: %s", e)
+            return []
+        finally:
+            try:
+                if cursor:
+                    cursor.close()
+            except Exception:
+                pass
+            try:
+                if conn:
+                    conn.close()
+            except Exception:
+                pass
 
 
 def fetch_initial_devices() -> List[Device]:

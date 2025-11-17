@@ -1,5 +1,4 @@
 # Minimal requirements for the listener
 pyzk
-requests
 python-dotenv
 pyodbc

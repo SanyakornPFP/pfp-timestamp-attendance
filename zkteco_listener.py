@@ -1,572 +1,280 @@
-"""Continuously monitor ZKTeco devices and print scanned user IDs.
-This script polls each device (port 4370) using the `zk` Python package.
-It keeps a small in-memory set of already-seen attendance records and prints
-only new user IDs as they appear.
-Requirements:
-  pip install pyzk
-Run:
-  python zkteco_listener.py
-"""
-
-import threading
-import time
 import logging
-import socket
 import os
-import json
-import urllib.request
-from queue import Queue
-from typing import Set, Tuple
-from datetime import datetime, date
+import threading
+import signal
+import sys
+from typing import List, Optional, Union
+from datetime import datetime
 
-from device import fetch_initial_devices
+import pyodbc
+from dotenv import load_dotenv
+
+from device import fetch_initial_devices, Device
+
+try:
+	from zk import ZK
+except ImportError:
+	raise SystemExit("Missing dependency 'pyzk'. Install via pip: pip install pyzk")
 
 logger = logging.getLogger("zkteco_listener")
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
-
-# enable faulthandler to dump Python tracebacks on deadlocks/crashes
-import faulthandler
-faulthandler.enable()
-
-# seen-prune configuration (overridable via env)
-_SEEN_PRUNE_INTERVAL = int(os.environ.get("SEEN_PRUNE_INTERVAL", "300"))
-_SEEN_MAX_AGE = int(os.environ.get("SEEN_MAX_AGE", "3600"))
-_SEEN_MAX_SIZE = int(os.environ.get("SEEN_MAX_SIZE", "20000"))
-
-
-try:
-    import zk as zk_module
-    from zk import ZK, const
-except Exception as e:
-    logger.error("Missing dependency 'zk'. Install with: pip install zk - or ensure correct package provides ZK class: %s", e)
-    raise
-
-# Optional: prefer requests if available for simpler HTTP calls
-try:
-    import requests
-except Exception:
-    requests = None
-
-# Webhook queue + worker to reuse connections and avoid ephemeral port exhaustion
-_WEBHOOK_URL = os.environ.get(
-    "N8N_WEBHOOK_URL",
-    # "https://n8n.pfpintranet.com/webhook/c70ded1f-e6e4-4cb2-8038-4407e733a546"
-    "https://n8n.pfpintranet.com/webhook-test/c70ded1f-e6e4-4cb2-8038-4407e733a546"
+logging.basicConfig(
+	level=os.getenv("LOG_LEVEL", "INFO"),
+	format="%(asctime)s %(levelname)s [%(threadName)s] %(message)s",
 )
-_webhook_q: Queue = Queue()
-_WEBHOOK_WORKERS = int(os.environ.get("N8N_WEBHOOK_WORKERS", "3"))
-_WEBHOOK_TIMEOUT = float(os.environ.get("N8N_WEBHOOK_TIMEOUT", "5"))
-
-if requests:
-    _session = requests.Session()
-    adapter = requests.adapters.HTTPAdapter(pool_connections=20, pool_maxsize=20, max_retries=1)
-    _session.mount("https://", adapter)
-else:
-    _session = None
 
 
-def _webhook_worker():
-    while True:
-        ip, name, userid, ts = _webhook_q.get()
-        # Get local machine IP
-        local_ip = socket.gethostbyname(socket.gethostname())
-        payload = {"device_ip": ip, "local_ip": local_ip, "device": name, "userid": userid, "timestamp": ts}
-        headers = {"Content-Type": "application/json"}
-        # simple retry with backoff
-        attempt = 0
-        max_attempts = 3
-        backoff = 0.5
-        while attempt < max_attempts:
-            try:
-                if _session:
-                    resp = _session.post(_WEBHOOK_URL, json=payload, headers=headers, timeout=_WEBHOOK_TIMEOUT)
-                    # logger.info("Webhook %s -> status=%s", _WEBHOOK_URL, getattr(resp, "status_code", None))
-                else:
-                    data = json.dumps(payload).encode("utf-8")
-                    req = urllib.request.Request(_WEBHOOK_URL, data=data, headers=headers, method="POST")
-                    with urllib.request.urlopen(req, timeout=_WEBHOOK_TIMEOUT) as r:
-                        status = getattr(r, "status", None)
-                        # logger.info("Webhook %s -> status=%s", _WEBHOOK_URL, status)
-                break
-            except Exception as e:
-                attempt += 1
-                logger.warning("Failed to send webhook to %s for %s (attempt %d/%d): %s", _WEBHOOK_URL, ip, attempt, max_attempts, e)
-                time.sleep(backoff)
-                backoff *= 2
-        _webhook_q.task_done()
+STOP_EVENT = threading.Event()
+
+# Load environment variables from .env if present
+load_dotenv()
 
 
-# start workers
-for _ in range(_WEBHOOK_WORKERS):
-    t = threading.Thread(target=_webhook_worker, daemon=True)
-    t.start()
+def _choose_sql_driver(env_driver: Optional[str] = None) -> Optional[str]:
+	available_drivers = [d for d in pyodbc.drivers() if d and d.strip()]
+	preferred = []
+	if env_driver:
+		preferred.append(env_driver)
+	preferred.extend([
+		'ODBC Driver 18 for SQL Server',
+		'ODBC Driver 17 for SQL Server',
+		'ODBC Driver 13 for SQL Server',
+		'SQL Server Native Client 11.0',
+		'SQL Server'
+	])
+	for d in preferred:
+		if d in available_drivers:
+			return d
+	return None
 
 
-def enqueue_webhook(ip: str, name: str, userid: str, ts: str) -> None:
-    try:
-        _webhook_q.put_nowait((ip, name, userid, ts))
-    except Exception as e:
-        logger.warning("Failed to enqueue webhook for %s: %s", ip, e)
+def _open_sql_connection() -> Optional[pyodbc.Connection]:
+	server = os.getenv("MSSQL_SERVER")
+	database = os.getenv("MSSQL_DATABASE")
+	username = os.getenv("MSSQL_USER")
+	password = os.getenv("MSSQL_PASSWORD")
+	env_driver = os.getenv("MSSQL_ODBC_DRIVER")
 
-def is_timestamp_today(ts: str) -> bool:
-    """Return True if the provided timestamp string represents today's date.
+	missing = [name for name, val in (("MSSQL_SERVER", server), ("MSSQL_DATABASE", database), ("MSSQL_USER", username), ("MSSQL_PASSWORD", password)) if not val]
+	if missing:
+		logger.error("Missing MSSQL env vars for WorkTimeAlert: %s", ",".join(missing))
+		return None
 
-    This function is defensive: it tries several common formats and epoch
-    representations. If it cannot confidently parse the timestamp, it
-    returns False so we avoid sending outdated/unknown-date events.
-    """
-    if not ts:
-        return False
-    s = str(ts).strip()
-    # epoch seconds or milliseconds
-    try:
-        if s.isdigit():
-            val = int(s)
-            # treat >10 digits as milliseconds
-            if len(s) > 10:
-                val = val / 1000
-            dt = datetime.fromtimestamp(val)
-            return dt.date() == date.today()
-    except Exception:
-        pass
+	driver = _choose_sql_driver(env_driver)
+	if not driver:
+		logger.error("No suitable ODBC driver found for SQL Server. Set MSSQL_ODBC_DRIVER or install Microsoft ODBC driver.")
+		return None
 
-    # common datetime formats
-    fmts = [
-        "%Y-%m-%d %H:%M:%S",
-        "%Y-%m-%dT%H:%M:%S",
-        "%d/%m/%Y %H:%M:%S",
-        "%d-%m-%Y %H:%M:%S",
-        "%Y/%m/%d %H:%M:%S",
-        "%Y-%m-%d %H:%M",
-        "%Y-%m-%d",
-    ]
-    for f in fmts:
-        try:
-            dt = datetime.strptime(s, f)
-            return dt.date() == date.today()
-        except Exception:
-            continue
-
-    # try a relaxed ISO-like parse (strip fractional seconds/timezone)
-    try:
-        cleaned = s.split(".")[0].replace("T", " ")
-        cleaned = cleaned.split("+")[0].split("Z")[0].strip()
-        dt = datetime.strptime(cleaned, "%Y-%m-%d %H:%M:%S")
-        return dt.date() == date.today()
-    except Exception:
-        pass
-
-    # substring checks for common date patterns
-    if date.today().isoformat() in s:
-        return True
-    if date.today().strftime("%d/%m/%Y") in s:
-        return True
-
-    logger.debug("Could not parse timestamp '%s' to determine if it's today", ts)
-    return False
+	conn_str = f"DRIVER={{{driver}}};SERVER={server};DATABASE={database};UID={username};PWD={password};TrustServerCertificate=yes;"
+	try:
+		return pyodbc.connect(conn_str, timeout=5)
+	except Exception as e:
+		logger.error("Open SQL connection failed: %s", e)
+		return None
 
 
-def monitor_device(ip: str, name: str, poll_interval: float = 5.0):
-    """Connect to a device and poll attendance logs, printing new userids.
+def _parse_attendance_timestamp(value) -> Optional[datetime]:
+	if value is None:
+		return None
 
-    Use a timestamped `seen` dict and prune it periodically to prevent
-    unbounded memory growth when running long-lived in Docker.
-    """
-    seen = {}  # key_str -> last_seen_timestamp
-    _last_prune = time.time()
-    # reconnect backoff (exponential) to avoid tight reconnect loops
-    reconnect_backoff = 1.0
-    reconnect_backoff_max = 60.0
 
-    while True:
-        zk = None
-        conn = None
-        try:
-            zk = ZK(ip, port=4370, timeout=5)
-            conn = zk.connect()
-            # connected: reset backoff
-            reconnect_backoff = 1.0
-            # logger.info("Connected to device %s (%s)", ip, name)
-            # Optional: Sync time or disable device while reading
-            while True:
-                try:
-                    records = conn.live_capture()
-                except Exception as e:
-                    # If the device does not support RWB (read-with-buffer) some
-                    # devices will raise a ZKErrorResponse("RWB Not supported").
-                    # In that case try a more compatible fallback: pull the
-                    # attendance list with `get_attendance()` if available.
-                    try:
-                        if hasattr(zk_module, 'exception') and isinstance(e, zk_module.exception.ZKErrorResponse) and "RWB Not supported" in str(e):
-                            logger.warning("Device %s (%s) reported RWB not supported — falling back to get_attendance()", ip, name)
-                            try:
-                                # Some ZK implementations expose get_attendance()
-                                # which returns a list of attendance records.
-                                if hasattr(conn, 'get_attendance'):
-                                    records = conn.get_attendance()
-                                elif hasattr(conn, 'get_attendance_data'):
-                                    records = conn.get_attendance_data()
-                                else:
-                                    raise AttributeError("no get_attendance fallback on conn")
-                            except Exception as fb_e:
-                                logger.exception("Fallback attendance read failed for %s (%s): %s", ip, name, fb_e)
-                                break
-                        else:
-                            # Log specific network/timeouts from the ZK library or socket
-                            if hasattr(zk_module, 'exception') and isinstance(e, zk_module.exception.ZKNetworkError):
-                                logger.warning("Device %s (%s) network error during get_attendance: %s", ip, name, e)
-                            elif isinstance(e, (socket.timeout, TimeoutError)):
-                                logger.warning("Timeout reading attendance from %s (%s): %s", ip, name, e)
-                            else:
-                                logger.debug("get_attendance failed for %s (%s): %s", ip, name, e)
-                    except Exception:
-                        logger.debug("get_attendance exception for %s (%s): %s", ip, name, e)
-                        break
+def _normalize_user_id(user_id: Optional[Union[str, int]]) -> Optional[str]:
+	"""Return user_id as a zero-left-padded 5-char string (e.g., 5233 -> 05233).
+	If user_id is None or empty after str/strip, returns None.
+	"""
+	if user_id is None:
+		return None
+	s = str(user_id).strip()
+	if not s:
+		return None
+	if len(s) < 5:
+		s = s.zfill(5)
+	return s
+	if isinstance(value, datetime):
+		return value
+	try:
+		# Common format: 'YYYY-MM-DD HH:MM:SS'
+		return datetime.fromisoformat(str(value))
+	except Exception:
+		return None
 
-                # Some drivers return a list of tuples/rows, others a single
-                # Attendance object. Normalize into an iterable of record-like
-                # values and extract userid/timestamp defensively.
-                if records is None:
-                    time.sleep(poll_interval)
-                    continue
 
-                # If a single object (non-iterable), wrap it
-                try:
-                    iter(records)
-                    rec_iter = records
-                except TypeError:
-                    rec_iter = [records]
+def upsert_worktime_alert_if_needed(db: pyodbc.Connection, emp_id, ip: str, ts: datetime) -> bool:
+	"""Insert a row into WorkTimeAlert if last scan for today is >= 10 minutes ago.
 
-                for rec in rec_iter:
-                    # protect processing of an individual record so a
-                    # malformed record doesn't kill the whole device loop
-                    try:
-                        # Normalize record into a tuple-like sequence (user, ts, ...)
-                        pass
-                    except Exception as _rec_err:
-                        logger.warning("Skipping bad record from %s (%s): %s", ip, name, _rec_err)
-                        # continue to next record
-                        continue
+	Returns True if inserted, False if skipped.
+	"""
+	try:
+		cur = db.cursor()
+		# Get latest record for this employee and device today
+		cur.execute(
+			"""
+			SELECT TOP 1 [DateTimeStamp]
+			FROM [EmpBook_db].[dbo].[WorkTimeAlert] WITH (NOLOCK)
+			WHERE [EmpId] = ? AND [IPStamp] = ? AND CAST([DateTimeStamp] AS date) = CAST(? AS date)
+			ORDER BY [DateTimeStamp] DESC
+			""",
+			emp_id, ip, ts
+		)
+		row = cur.fetchone()
+		if row and row[0]:
+			last_ts = row[0]
+			# pyodbc returns datetime already; ensure type
+			if not isinstance(last_ts, datetime):
+				try:
+					last_ts = datetime.fromisoformat(str(last_ts))
+				except Exception:
+					last_ts = None
+			if last_ts is not None:
+				diff_sec = (ts - last_ts).total_seconds()
+				if diff_sec < 600:
+					# Less than 10 minutes, skip insert
+					return False
 
-                    # --- actual processing continues below ---
-                    # Normalize record into a tuple-like sequence (user, ts, ...)
-                    def record_to_tuple(r):
-                        # If already sequence-like, convert directly
-                        if isinstance(r, (list, tuple)):
-                            return tuple(r)
+		# Insert new alert
+		cur.execute(
+			"""
+			INSERT INTO [EmpBook_db].[dbo].[WorkTimeAlert] ([DateTimeStamp],[EmpId],[IPStamp],[IsSend])
+			VALUES (?,?,?,0)
+			""",
+			ts, emp_id, ip
+		)
+		db.commit()
+		return True
+	except Exception as e:
+		logger.error("WorkTimeAlert insert check failed for emp=%s ip=%s: %s", emp_id, ip, e)
+		try:
+			db.rollback()
+		except Exception:
+			pass
+		return False
 
-                        # Try common attribute names on Attendance-like objects
-                        attrs_user = ("user_id", "userid", "user", "uid", "id", "pin", "enroll_number", "badge", "card", "cardid")
-                        attrs_time = ("timestamp", "time", "check_time", "datetime", "date_time")
-                        u = None
-                        t = None
 
-                        for a in attrs_user:
-                            u = getattr(r, a, None)
-                            if u is not None:
-                                break
-                        for a in attrs_time:
-                            t = getattr(r, a, None)
-                            if t is not None:
-                                break
+def run_live_capture(device: Device, port: int) -> None:
+	"""Connect to a ZKTeco device and stream live attendance events.
 
-                        # If object has a dict-like representation, try that for missing values
-                        d = {}
-                        if hasattr(r, "__dict__"):
-                            d = getattr(r, "__dict__", {}) or {}
-                            if u is None:
-                                for a in attrs_user:
-                                    if a in d and d[a] is not None:
-                                        u = d[a]
-                                        break
-                            if t is None:
-                                for a in attrs_time:
-                                    if a in d and d[a] is not None:
-                                        t = d[a]
-                                        break
+	Only uses the live_capture() generator. Runs until STOP_EVENT is set.
+	"""
+	zk = ZK(
+		device.ip,
+		port=port,
+		timeout=10,
+		password=0,
+		force_udp=False,
+		ommit_ping=False,
+	)
+	conn = None
+	db_conn = None
+	try:
+		logger.info("Connecting to device '%s' (%s:%d)", device.name, device.ip, port)
+		conn = zk.connect()
+		logger.info("Connected: %s (%s)", device.name, device.ip)
+		# Open a DB connection for this thread
+		db_conn = _open_sql_connection()
+		if db_conn is None:
+			logger.error("DB connection unavailable; live capture will still run but inserts disabled.")
 
-                        # If we found a numeric userid, try to locate a string representation
-                        # that preserves leading zeros by inspecting dict values and repr
-                        try:
-                            if u is not None:
-                                # normalize bytes to str
-                                if isinstance(u, (bytes, bytearray)):
-                                    u = u.decode(errors="ignore")
+		# live_capture is a generator producing attendance events continuously
+		for attendance in conn.live_capture():
+			if STOP_EVENT.is_set():
+				break
+			# Skip empty / heartbeat messages (None)
+			if attendance is None:
+				continue
+			# Safely extract attributes (pyzk Attendance object can vary by device)
+			user_id_raw = getattr(attendance, 'user_id', getattr(attendance, 'uid', None))
+			user_id = _normalize_user_id(user_id_raw)
+			timestamp = getattr(attendance, 'timestamp', getattr(attendance, 'time', None))
+			status = getattr(attendance, 'status', None)
+			punch = getattr(attendance, 'punch', getattr(attendance, 'type', None))
+			# Format similar to requested example
+			# Only log when it's a real attendance
+			logger.info("LiveCapture %s: <Attendance>: %s : %s (%s, %s)", device.ip, user_id, timestamp, status, punch)
 
-                                # If it's an int (or numeric string), look for a matching
-                                # string value elsewhere that contains leading zeros.
-                                numeric_val = None
-                                if isinstance(u, int):
-                                    numeric_val = u
-                                elif isinstance(u, str) and u.isdigit():
-                                    # keep string but also consider it numeric
-                                    numeric_val = int(u)
+			# Insert into WorkTimeAlert with 10-minute spacing
+			if db_conn is not None and user_id is not None:
+				ts_dt = _parse_attendance_timestamp(timestamp) or datetime.now()
+				inserted = upsert_worktime_alert_if_needed(db_conn, user_id, device.ip, ts_dt)
+				if inserted:
+					logger.debug("Inserted WorkTimeAlert for emp=%s ip=%s at %s", user_id, device.ip, ts_dt)
+				else:
+					logger.debug("Skipped insert (within 10 minutes) for emp=%s ip=%s", user_id, device.ip)
+	except KeyboardInterrupt:
+		pass
+	except Exception as e:
+		logger.error("Device %s (%s) error: %s", device.name, device.ip, e)
+	finally:
+		try:
+			if conn:
+				conn.disconnect()
+		except Exception:
+			pass
+		try:
+			if db_conn:
+				db_conn.close()
+		except Exception:
+			pass
+		logger.info("Disconnected from %s (%s)", device.name, device.ip)
 
-                                if numeric_val is not None:
-                                    # search d values for a zero-padded string equal to numeric_val
-                                    for v in d.values():
-                                        if isinstance(v, (bytes, bytearray)):
-                                            try:
-                                                v = v.decode()
-                                            except Exception:
-                                                continue
-                                        if isinstance(v, str) and v.isdigit():
-                                            try:
-                                                if int(v) == numeric_val and (v.lstrip('0') != v or v == '0'):
-                                                    u = v
-                                                    break
-                                            except Exception:
-                                                continue
 
-                                    # if not found in dict, try to scan the string representation
-                                    if isinstance(u, (int,)) or (isinstance(u, str) and u.isdigit() and u == str(numeric_val)):
-                                        s = str(r)
-                                        # find digit substrings with leading zeros
-                                        import re
-                                        for m in re.finditer(r"0+\d+", s):
-                                            candidate = m.group(0)
-                                            try:
-                                                if int(candidate) == numeric_val:
-                                                    u = candidate
-                                                    break
-                                            except Exception:
-                                                continue
-                        except Exception:
-                            # be defensive: if anything goes wrong, fall back to original u
-                            pass
+def setup_signal_handlers(threads: List[threading.Thread]):
+	def _handler(signum, frame):
+		logger.info("Signal %s received – stopping live capture...", signum)
+		STOP_EVENT.set()
+		for t in threads:
+			t.join(timeout=5)
+		logger.info("All threads stopped. Exiting.")
+		sys.exit(0)
 
-                        # Fallback: stringify the object if nothing useful found
-                        if u is None and t is None:
-                            return (str(r),)
-
-                        return (u, t) if t is not None else (u,)
-
-                    try:
-                        tup = record_to_tuple(rec)
-                    except Exception:
-                        # logger.debug("Failed to normalize record %r", rec)
-                        tup = (str(rec),)
-
-                    key = tuple(map(str, tup))
-                    key_str = "\x1f".join(key)
-
-                    # periodic pruning
-                    now = time.time()
-                    if now - _last_prune >= _SEEN_PRUNE_INTERVAL:
-                        try:
-                            cutoff = now - _SEEN_MAX_AGE
-                            # remove old entries
-                            old = [k for k, ts in seen.items() if ts < cutoff]
-                            for k in old:
-                                seen.pop(k, None)
-                            # trim if still too large
-                            if len(seen) > _SEEN_MAX_SIZE:
-                                items = sorted(seen.items(), key=lambda kv: kv[1], reverse=True)[:_SEEN_MAX_SIZE]
-                                seen = dict(items)
-                            logger.debug("pruned seen cache, size=%d", len(seen))
-                        except Exception:
-                            logger.exception("Error pruning seen cache")
-                        _last_prune = now
-
-                    if key_str not in seen:
-                        seen[key_str] = now
-
-                        # Preserve leading zeros for user ids when possible.
-                        # If the normalized value is an int, try to find a
-                        # zero-padded string in the original record's dict
-                        # or string representation; otherwise fall back to str().
-                        def _format_userid(u, original_rec):
-                            try:
-                                # normalize bytes -> str
-                                if isinstance(u, (bytes, bytearray)):
-                                    u = u.decode(errors="ignore")
-
-                                # Helper to search for a zero-padded string matching numeric_val
-                                def _search_zero_padded(numeric_val):
-                                    d = {}
-                                    if hasattr(original_rec, "__dict__"):
-                                        d = getattr(original_rec, "__dict__", {}) or {}
-                                    for v in d.values():
-                                        if isinstance(v, (bytes, bytearray)):
-                                            try:
-                                                v = v.decode()
-                                            except Exception:
-                                                continue
-                                        if isinstance(v, str) and v.isdigit():
-                                            try:
-                                                if int(v) == numeric_val and (v.lstrip("0") != v or v == "0"):
-                                                    return v
-                                            except Exception:
-                                                continue
-                                    # Fallback: scan string repr for zero-padded digit substrings
-                                    import re
-                                    s = str(original_rec)
-                                    for m in re.finditer(r"0+\d+", s):
-                                        candidate = m.group(0)
-                                        try:
-                                            if int(candidate) == numeric_val:
-                                                return candidate
-                                        except Exception:
-                                            continue
-                                    return None
-
-                                # if string
-                                if isinstance(u, str):
-                                    # numeric string -> try to find zero-padded variant
-                                    if u.isdigit():
-                                        try:
-                                            numeric_val = int(u)
-                                        except Exception:
-                                            return u
-                                        found = _search_zero_padded(numeric_val)
-                                        return found if found is not None else u
-                                    # non-numeric string -> return as-is
-                                    return u
-
-                                # if int -> search for zero-padded variant
-                                if isinstance(u, int):
-                                    found = _search_zero_padded(u)
-                                    return found if found is not None else str(u)
-
-                                # fallback for other types
-                                return str(u) if u is not None else ""
-                            except Exception:
-                                return str(u) if u is not None else ""
-
-                        userid = _format_userid(tup[0], rec) if len(tup) > 0 else ""
-
-                        # Robust fallback extraction: if userid is empty or appears
-                        # invalid, scan other tup elements, rec.__dict__ and str(rec)
-                        # to find the best numeric candidate (prefer longest match).
-                        try:
-                            if userid is None:
-                                userid = ""
-                            s0 = str(userid).strip()
-                            if s0.lower() == "none" or s0 == "":
-                                userid = ""
-
-                            def _best_digit_from_string(s):
-                                import re
-                                best = None
-                                for m in re.finditer(r"\d+", s or ""):
-                                    cand = m.group(0)
-                                    if best is None or len(cand) > len(best):
-                                        best = cand
-                                return best
-
-                            # if we already have a digit candidate, prefer it
-                            if userid:
-                                best = _best_digit_from_string(str(userid))
-                                if best:
-                                    userid = best.zfill(5) if len(best) < 5 else best
-                            # try tup elements
-                            if not userid:
-                                for v in tup:
-                                    try:
-                                        vs = str(v)
-                                    except Exception:
-                                        continue
-                                    best = _best_digit_from_string(vs)
-                                    if best:
-                                        userid = best.zfill(5) if len(best) < 5 else best
-                                        break
-                            # try record dict
-                            if not userid and hasattr(rec, "__dict__"):
-                                for v in (getattr(rec, "__dict__", {}) or {}).values():
-                                    try:
-                                        vs = str(v)
-                                    except Exception:
-                                        continue
-                                    best = _best_digit_from_string(vs)
-                                    if best:
-                                        userid = best.zfill(5) if len(best) < 5 else best
-                                        break
-                            # last resort: scan string representation of rec
-                            if not userid:
-                                best = _best_digit_from_string(str(rec))
-                                if best:
-                                    userid = best.zfill(5) if len(best) < 5 else best
-
-                            # keep non-numeric string as-is (no padding) if nothing numeric found
-                        except Exception:
-                            userid = str(userid) if userid is not None else ""
-
-                        # If userid or timestamp are empty, skip printing/enqueueing
-                        ts = str(tup[1]) if len(tup) > 1 else ""
-                        if not userid or not ts:
-                            # Keep a debug trace so we can diagnose malformed records,
-                            # but avoid noisy printed lines like: "scanned user:  at "
-                            logger.debug(
-                                "Skipping record without userid or timestamp for device %s (%s) — userid=%r ts=%r rec=%r tup=%r",
-                                ip,
-                                name,
-                                userid,
-                                ts,
-                                rec,
-                                tup,
-                            )
-                            continue
-
-                        msg = f"{ip} [{name}] scanned user: {userid} at {ts}"
-                        print(msg)
-                        # Only enqueue webhook if timestamp is today
-                        try:
-                            if is_timestamp_today(ts):
-                                enqueue_webhook(ip, name, userid, ts)
-                            else:
-                                logger.debug("Skipping webhook for %s: timestamp not today (%s)", ip, ts)
-                        except Exception as e:
-                            logger.debug("Failed to enqueue webhook for %s: %s", ip, e)
-                time.sleep(poll_interval)
-        except Exception as e:
-            # Handle ZK network/timeouts more explicitly so logs are informative
-            try:
-                if isinstance(e, zk_module.exception.ZKNetworkError):
-                    logger.warning("Network error connecting to %s (%s): %s", ip, name, e)
-                elif isinstance(e, (socket.timeout, TimeoutError)):
-                    logger.warning("Timeout connecting to %s (%s): %s", ip, name, e)
-                else:
-                    logger.exception("Connection/monitor error for %s (%s): %s", ip, name, e)
-            except Exception:
-                # If zk_module or its exception class isn't available, fall back
-                if isinstance(e, (socket.timeout, TimeoutError)):
-                    logger.warning("Timeout connecting to %s (%s): %s", ip, name, e)
-                else:
-                    logger.exception("Connection/monitor error for %s (%s)", ip, name)
-        finally:
-            try:
-                if conn:
-                    conn.disconnect()
-            except Exception:
-                pass
-        # Wait before reconnecting (exponential backoff)
-        try:
-            logger.info("Reconnecting to %s (%s) after %.1fs", ip, name, reconnect_backoff)
-            time.sleep(reconnect_backoff)
-        except Exception:
-            time.sleep(3)
-        # increase backoff for next attempt, capped
-        reconnect_backoff = min(reconnect_backoff * 2, reconnect_backoff_max)
+	for sig in (signal.SIGINT, signal.SIGTERM):
+		try:
+			signal.signal(sig, _handler)
+		except Exception:
+			# On Windows, SIGTERM may not be available; ignore silently
+			pass
 
 
 def main():
-    devices = fetch_initial_devices()
-    if not devices:
-        logger.error("No devices found from device.fetch_initial_devices()")
-        return
-    threads = []
-    for d in devices:
-        t = threading.Thread(target=monitor_device, args=(d.ip, d.name), daemon=True)
-        t.start()
-        threads.append(t)
-        time.sleep(0.2)
+	port_env = os.getenv("ZK_PORT")
+	try:
+		port = int(port_env) if port_env else 4370
+	except ValueError:
+		logger.warning("Invalid ZK_PORT '%s', falling back to 4370", port_env)
+		port = 4370
 
-    # Keep main thread alive
-    try:
-        while True:
-            time.sleep(1)
-    except KeyboardInterrupt:
-        logger.info("Shutting down listener")
+	devices = fetch_initial_devices()
+	if not devices:
+		logger.error("No devices loaded from database. Ensure DB connectivity and records.")
+		return 1
+
+	logger.info("Loaded %d devices: %s", len(devices), 
+				", ".join(f"{d.name}({d.ip})" for d in devices))
+
+	threads: List[threading.Thread] = []
+	for device in devices:
+		t = threading.Thread(
+			target=run_live_capture, args=(device, port), name=f"LiveCapture-{device.ip}", daemon=True
+		)
+		threads.append(t)
+		t.start()
+
+	setup_signal_handlers(threads)
+
+	logger.info("Live capture running. Press Ctrl+C to stop.")
+	try:
+		while any(t.is_alive() for t in threads):
+			for t in threads:
+				t.join(timeout=0.5)
+			if STOP_EVENT.is_set():
+				break
+	except KeyboardInterrupt:
+		STOP_EVENT.set()
+		for t in threads:
+			t.join(timeout=5)
+
+	logger.info("Shutdown complete.")
+	return 0
+
 
 if __name__ == "__main__":
-    main()
+	sys.exit(main())
+
