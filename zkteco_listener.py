@@ -4,7 +4,7 @@ import threading
 import signal
 import sys
 from typing import List, Optional, Union
-from datetime import datetime
+from datetime import datetime, timedelta
 
 import pyodbc
 from dotenv import load_dotenv
@@ -72,9 +72,38 @@ def _open_sql_connection() -> Optional[pyodbc.Connection]:
 		return None
 
 
+try:
+	ATTENDANCE_TZ_OFFSET = int(os.getenv("ATTENDANCE_TZ_OFFSET", "0"))
+except ValueError:
+	ATTENDANCE_TZ_OFFSET = 0
+	logger.warning("Invalid ATTENDANCE_TZ_OFFSET; falling back to 0.")
+
+
 def _parse_attendance_timestamp(value) -> Optional[datetime]:
+	"""Parse an attendance timestamp value to a datetime.
+
+	Supports already-datetime objects and ISO/basic string formats. Applies an
+	optional hour offset via ATTENDANCE_TZ_OFFSET env (e.g. set to 7 for UTC+7).
+	Returns None if parsing fails.
+	"""
 	if value is None:
 		return None
+	if isinstance(value, datetime):
+		dt = value
+	else:
+		# Try ISO first
+		try:
+			dt = datetime.fromisoformat(str(value))
+		except Exception:
+			# Fallback common format
+			try:
+				dt = datetime.strptime(str(value), "%Y-%m-%d %H:%M:%S")
+			except Exception:
+				return None
+	# Apply timezone offset if configured
+	if ATTENDANCE_TZ_OFFSET:
+		dt = dt + timedelta(hours=ATTENDANCE_TZ_OFFSET)
+	return dt
 
 
 def _normalize_user_id(user_id: Optional[Union[str, int]]) -> Optional[str]:
@@ -89,13 +118,6 @@ def _normalize_user_id(user_id: Optional[Union[str, int]]) -> Optional[str]:
 	if len(s) < 5:
 		s = s.zfill(5)
 	return s
-	if isinstance(value, datetime):
-		return value
-	try:
-		# Common format: 'YYYY-MM-DD HH:MM:SS'
-		return datetime.fromisoformat(str(value))
-	except Exception:
-		return None
 
 
 def upsert_worktime_alert_if_needed(db: pyodbc.Connection, emp_id, ip: str, ts: datetime) -> bool:
