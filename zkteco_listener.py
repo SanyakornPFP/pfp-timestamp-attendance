@@ -120,68 +120,137 @@ def _normalize_user_id(user_id: Optional[Union[str, int]]) -> Optional[str]:
 	return s
 
 
+def get_employee_shift(db: pyodbc.Connection, emp_id: str, ts: datetime):
+	"""ดึงข้อมูลกะงานจาก [db_pfpdashboard].[dbo].[VListPeriodEmployee]
+	ตรวจสอบทั้งวันนี้และเมื่อวานเพื่อรองรับกะงานข้ามคืน
+	"""
+	try:
+		cur = db.cursor()
+		date_today = ts.date()
+		date_yesterday = date_today - timedelta(days=1)
+
+		cur.execute(
+			"""
+			SELECT [DatePeriod], [InTmp], [OutTmp]
+			FROM [db_pfpdashboard].[dbo].[VListPeriodEmployee] WITH (NOLOCK)
+			WHERE [EmpId] = ? AND [DatePeriod] IN (?, ?)
+			ORDER BY [DatePeriod] DESC
+			""",
+			emp_id, date_today, date_yesterday
+		)
+		rows = cur.fetchall()
+
+		for row in rows:
+			d_period, in_val, out_val = row
+			if not in_val or not out_val:
+				continue
+			
+			# แปลงเวลา (InTmp/OutTmp) เป็น datetime
+			def combine_time(d, t):
+				if isinstance(t, str):
+					try: t = datetime.strptime(t[:5], "%H:%M").time()
+					except: return None
+				return datetime.combine(d, t)
+
+			shift_start = combine_time(d_period.date() if hasattr(d_period, "date") else d_period, in_val)
+			shift_end = combine_time(d_period.date() if hasattr(d_period, "date") else d_period, out_val)
+
+			if not shift_start or not shift_end:
+				continue
+
+			# กรณีดึก (เช่น 22:00 - 06:00)
+			if shift_end <= shift_start:
+				shift_end += timedelta(days=1)
+
+			# กำหนดช่วงเวลา (Window) ที่อนุญาตให้บันทึกในกะนี้ (เช่น ก่อนสแกนเข้า 4 ชม. ถึง หลังสแกนออก 8 ชม.)
+			window_start = shift_start - timedelta(hours=4)
+			window_end = shift_end + timedelta(hours=8)
+
+			if window_start <= ts <= window_end:
+				return d_period, shift_start, shift_end
+
+		return None, None, None
+	except Exception as e:
+		logger.error("Fetch shift failed for %s: %s", emp_id, e)
+		return None, None, None
+
+
 def upsert_attendance_log(db: pyodbc.Connection, emp_id: str, ip: str, ts: datetime) -> bool:
-	"""บันทึกเวลาเข้า-ออก (TimeIn/TimeOut) โดยรองรับการทำงานข้ามวัน (Shift)
+	"""บันทึกเวลาเข้า-ออก โดยอ้างอิงจากกะงาน (Shift-based Logic)
 	
 	เงื่อนไข:
-	1. ค้นหา Record ล่าสุดของพนักงาน
-	2. ถ้าพบ Record ที่ 'ยังไม่บันทึกเวลาออก' (TimeOut IS NULL) และห่างจากเวลาเข้าไม่เกิน 16 ชม. -> UPDATE TimeOut
-	3. ถ้าพบ Record ที่ 'บันทึกเวลาออกไปแล้ว' แต่แสกนใหม่ภายใน 1 ชม. -> UPDATE ทับเวลาออกเดิม (Update Last TimeOut)
-	4. นอกเหนือจากนั้น -> INSERT เป็น Row ใหม่ (TimeIn)
+	1. ค้นหากะงานที่ครอบคลุมเวลาที่แสกน (ts)
+	2. ตรวจสอบว่าในกะนั้นมีการบันทึก TimeIn ไปแล้วหรือยัง
+	3. ถ้ายังไม่มี -> INSERT (TimeIn)
+	4. ถ้ามีแล้ว -> UPDATE (TimeOut)
 	"""
 	try:
 		cur = db.cursor()
 		
-		# ค้นหา Record ล่าสุดของพนักงานคนนี้
-		cur.execute(
-			"""
-			SELECT TOP 1 [Id], [DateTimeStamp], [TimeOut]
-			FROM [EmpBook_db].[dbo].[TimeAttandanceLog] WITH (NOLOCK)
-			WHERE [EmpId] = ?
-			ORDER BY [DateTimeStamp] DESC
-			""",
-			emp_id
-		)
+		# 1. ค้นหากะงาน
+		shift_date, shift_start, shift_end = get_employee_shift(db, emp_id, ts)
+
+		# 2. ค้นหา Record เดิมที่อยู่ในช่วงเวลาของกะงานนี้
+		if shift_date:
+			# ใช้ช่วงเวลาของกะงานเป็นเกณฑ์ในการหา Record (TimeIn ควรอยู่ใกล้ช่วงเริ่มกะ)
+			cur.execute(
+				"""
+				SELECT TOP 1 [Id], [TimeIn], [TimeOut]
+				FROM [EmpBook_db].[dbo].[TimeAttandanceLog] WITH (NOLOCK)
+				WHERE [EmpId] = ? 
+				  AND [TimeIn] >= ? 
+				  AND [TimeIn] <= ?
+				ORDER BY [TimeIn] DESC
+				""",
+				emp_id, 
+				shift_start - timedelta(hours=4),
+				shift_start + timedelta(hours=14)
+			)
+		else:
+			# Fallback: กรณีไม่พบกะงาน ให้ใช้ตรรกะเดิม (หา Record ล่าสุด)
+			cur.execute(
+				"""
+				SELECT TOP 1 [Id], [TimeIn], [TimeOut]
+				FROM [EmpBook_db].[dbo].[TimeAttandanceLog] WITH (NOLOCK)
+				WHERE [EmpId] = ?
+				ORDER BY [DateTimeStamp] DESC
+				""",
+				emp_id
+			)
+		
 		row = cur.fetchone()
 
 		if row:
-			row_id, first_ts, last_timeout = row
-			
-			# กรณีที่ 1: แถวยังไม่มีเวลาออก (Normal Scan Out)
-			if last_timeout is None:
-				diff_sec = (ts - first_ts).total_seconds()
-				if 0 < diff_sec < 16 * 3600:
-					# ป้องกันการแสกนซ้ำซ้อนภายในระยะเวลาน้อยกว่า 10 นาที
-					if diff_sec > 600:
-						cur.execute(
-							"""
-							UPDATE [EmpBook_db].[dbo].[TimeAttandanceLog]
-							SET [TimeOut] = ?, [IPStampOut] = ?
-							WHERE [Id] = ?
-							""",
-							ts, ip, row_id
-						)
-						db.commit()
-						return True
-					return False
-			
-			# กรณีที่ 2: มีเวลาออกแล้ว แต่แสกนอีกครั้งภายใน 1 ชม. (Update Last TimeOut)
-			else:
-				# ตรวจสอบว่าห่างจากเวลาออกล่าสุดไม่เกิน 1 ชม.
-				diff_from_last_out = (ts - last_timeout).total_seconds()
-				if 0 < diff_from_last_out < 3600:
-					cur.execute(
-						"""
-						UPDATE [EmpBook_db].[dbo].[TimeAttandanceLog]
-						SET [TimeOut] = ?, [IPStampOut] = ?
-						WHERE [Id] = ?
-						""",
-						ts, ip, row_id
-					)
-					db.commit()
-					return True
+			row_id, first_in, last_out = row
+			diff_sec = (ts - first_in).total_seconds()
 
-		# กรณีที่ 3: เปิดกะงานใหม่ (TimeIn)
+			# ป้องกันการแสกนซ้ำซ้อนในเวลาอันสั้น ( < 10 นาที)
+			if diff_sec < 600:
+				return False
+
+			# ถ้าเข้าเงื่อนไขว่าเคยสแกนเข้าแล้ว -> ให้บันทึกเป็นสแกนออก (Update TimeOut)
+			# รองรับทั้งการออกก่อนเวลา และการอัปเดตเวลาออกล่าสุด (ภายใน 1 ชม. หลังสแกนออกเดิม)
+			can_update = False
+			if last_out is None:
+				can_update = True
+			else:
+				diff_from_last_out = (ts - last_out).total_seconds()
+				if 0 < diff_from_last_out < 3600: # สแกนซ้ำภายใน 1 ชม. ให้ทับเวลาเดิม
+					can_update = True
+
+			if can_update:
+				cur.execute(
+					"""
+					UPDATE [EmpBook_db].[dbo].[TimeAttandanceLog]
+					SET [TimeOut] = ?, [IPStampOut] = ?
+					WHERE [Id] = ?
+					""",
+					ts, ip, row_id
+				)
+				db.commit()
+				return True
+
+		# 3. กรณีเข่างานครั้งแรกของกะ (TimeIn)
 		cur.execute(
 			"""
 			INSERT INTO [EmpBook_db].[dbo].[TimeAttandanceLog] 
@@ -193,11 +262,9 @@ def upsert_attendance_log(db: pyodbc.Connection, emp_id: str, ip: str, ts: datet
 		db.commit()
 		return True
 	except Exception as e:
-		logger.error("Attendance log failed for emp=%s ip=%s: %s", emp_id, ip, e)
-		try:
-			db.rollback()
-		except Exception:
-			pass
+		logger.error("Attendance log failed for emp=%s: %s", emp_id, e)
+		try: db.rollback()
+		except: pass
 		return False
 
 
