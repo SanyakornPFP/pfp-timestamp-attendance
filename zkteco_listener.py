@@ -151,8 +151,8 @@ def upsert_attendance_log(db: pyodbc.Connection, emp_id: str, ip: str, ts: datet
 			if last_timeout is None:
 				diff_sec = (ts - first_ts).total_seconds()
 				if 0 < diff_sec < 16 * 3600:
-					# ป้องกันการแสกนซ้ำซ้อนภายในระยะเวลาน้อยกว่า 1 นาที
-					if diff_sec > 60:
+					# ป้องกันการแสกนซ้ำซ้อนภายในระยะเวลาน้อยกว่า 10 นาที
+					if diff_sec > 600:
 						cur.execute(
 							"""
 							UPDATE [EmpBook_db].[dbo].[TimeAttandanceLog]
