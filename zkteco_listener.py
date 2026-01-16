@@ -120,50 +120,80 @@ def _normalize_user_id(user_id: Optional[Union[str, int]]) -> Optional[str]:
 	return s
 
 
-def upsert_worktime_alert_if_needed(db: pyodbc.Connection, emp_id, ip: str, ts: datetime) -> bool:
-	"""Insert a row into WorkTimeAlert if last scan for today is >= 10 minutes ago.
-
-	Returns True if inserted, False if skipped.
+def upsert_attendance_log(db: pyodbc.Connection, emp_id: str, ip: str, ts: datetime) -> bool:
+	"""บันทึกเวลาเข้า-ออก (TimeIn/TimeOut) โดยรองรับการทำงานข้ามวัน (Shift)
+	
+	เงื่อนไข:
+	1. ค้นหา Record ล่าสุดของพนักงาน
+	2. ถ้าพบ Record ที่ 'ยังไม่บันทึกเวลาออก' (TimeOut IS NULL) และห่างจากเวลาเข้าไม่เกิน 16 ชม. -> UPDATE TimeOut
+	3. ถ้าพบ Record ที่ 'บันทึกเวลาออกไปแล้ว' แต่แสกนใหม่ภายใน 1 ชม. -> UPDATE ทับเวลาออกเดิม (Update Last TimeOut)
+	4. นอกเหนือจากนั้น -> INSERT เป็น Row ใหม่ (TimeIn)
 	"""
 	try:
 		cur = db.cursor()
-		# Get latest record for this employee and device today
+		
+		# ค้นหา Record ล่าสุดของพนักงานคนนี้
 		cur.execute(
 			"""
-			SELECT TOP 1 [DateTimeStamp]
-			FROM [EmpBook_db].[dbo].[WorkTimeAlert] WITH (NOLOCK)
-			WHERE [EmpId] = ? AND [IPStamp] = ? AND CAST([DateTimeStamp] AS date) = CAST(? AS date)
+			SELECT TOP 1 [Id], [DateTimeStamp], [TimeOut]
+			FROM [EmpBook_db].[dbo].[TimeAttandanceLog] WITH (NOLOCK)
+			WHERE [EmpId] = ?
 			ORDER BY [DateTimeStamp] DESC
 			""",
-			emp_id, ip, ts
+			emp_id
 		)
 		row = cur.fetchone()
-		if row and row[0]:
-			last_ts = row[0]
-			# pyodbc returns datetime already; ensure type
-			if not isinstance(last_ts, datetime):
-				try:
-					last_ts = datetime.fromisoformat(str(last_ts))
-				except Exception:
-					last_ts = None
-			if last_ts is not None:
-				diff_sec = (ts - last_ts).total_seconds()
-				if diff_sec < 600:
-					# Less than 10 minutes, skip insert
-					return False
 
-		# Insert new alert
+		if row:
+			row_id, first_ts, last_timeout = row
+			
+			# กรณีที่ 1: แถวยังไม่มีเวลาออก (Normal Scan Out)
+			if last_timeout is None:
+				diff_sec = (ts - first_ts).total_seconds()
+				if 0 < diff_sec < 16 * 3600:
+					# ป้องกันการแสกนซ้ำซ้อนภายในระยะเวลาน้อยกว่า 1 นาที
+					if diff_sec > 60:
+						cur.execute(
+							"""
+							UPDATE [EmpBook_db].[dbo].[TimeAttandanceLog]
+							SET [TimeOut] = ?, [IPStampOut] = ?, [IsSend] = 0
+							WHERE [Id] = ?
+							""",
+							ts, ip, row_id
+						)
+						db.commit()
+						return True
+					return False
+			
+			# กรณีที่ 2: มีเวลาออกแล้ว แต่แสกนอีกครั้งภายใน 1 ชม. (Update Last TimeOut)
+			else:
+				# ตรวจสอบว่าห่างจากเวลาออกล่าสุดไม่เกิน 1 ชม.
+				diff_from_last_out = (ts - last_timeout).total_seconds()
+				if 0 < diff_from_last_out < 3600:
+					cur.execute(
+						"""
+						UPDATE [EmpBook_db].[dbo].[TimeAttandanceLog]
+						SET [TimeOut] = ?, [IPStampOut] = ?, [IsSend] = 0
+						WHERE [Id] = ?
+						""",
+						ts, ip, row_id
+					)
+					db.commit()
+					return True
+
+		# กรณีที่ 3: เปิดกะงานใหม่ (TimeIn)
 		cur.execute(
 			"""
-			INSERT INTO [EmpBook_db].[dbo].[WorkTimeAlert] ([DateTimeStamp],[EmpId],[IPStamp],[IsSend])
-			VALUES (?,?,?,0)
+			INSERT INTO [EmpBook_db].[dbo].[TimeAttandanceLog] 
+			([DateTimeStamp], [EmpId], [IPStampIn], [TimeIn], [TimeOut], [IsSend])
+			VALUES (?, ?, ?, ?, NULL, 0)
 			""",
-			ts, emp_id, ip
+			ts, emp_id, ip, ts
 		)
 		db.commit()
 		return True
 	except Exception as e:
-		logger.error("WorkTimeAlert insert check failed for emp=%s ip=%s: %s", emp_id, ip, e)
+		logger.error("Attendance log failed for emp=%s ip=%s: %s", emp_id, ip, e)
 		try:
 			db.rollback()
 		except Exception:
@@ -212,14 +242,14 @@ def run_live_capture(device: Device, port: int) -> None:
 			# Only log when it's a real attendance
 			logger.info("LiveCapture %s: <Attendance>: %s : %s (%s, %s)", device.ip, user_id, timestamp, status, punch)
 
-			# Insert into WorkTimeAlert with 10-minute spacing
+			# Insert into TimeAttandanceLog
 			if db_conn is not None and user_id is not None:
 				ts_dt = _parse_attendance_timestamp(timestamp) or datetime.now()
-				inserted = upsert_worktime_alert_if_needed(db_conn, user_id, device.ip, ts_dt)
+				inserted = upsert_attendance_log(db_conn, user_id, device.ip, ts_dt)
 				if inserted:
-					logger.debug("Inserted WorkTimeAlert for emp=%s ip=%s at %s", user_id, device.ip, ts_dt)
+					logger.info("Processed attendance for emp=%s at %s", user_id, ts_dt)
 				else:
-					logger.debug("Skipped insert (within 10 minutes) for emp=%s ip=%s", user_id, device.ip)
+					logger.debug("Skipped or updated (duplicate/threshold) for emp=%s", user_id)
 	except KeyboardInterrupt:
 		pass
 	except Exception as e:
@@ -299,4 +329,3 @@ def main():
 
 if __name__ == "__main__":
 	sys.exit(main())
-
