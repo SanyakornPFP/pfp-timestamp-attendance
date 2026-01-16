@@ -156,7 +156,7 @@ def upsert_attendance_log(db: pyodbc.Connection, emp_id: str, ip: str, ts: datet
 						cur.execute(
 							"""
 							UPDATE [EmpBook_db].[dbo].[TimeAttandanceLog]
-							SET [TimeOut] = ?, [IPStampOut] = ?, [IsSend] = 0
+							SET [TimeOut] = ?, [IPStampOut] = ?
 							WHERE [Id] = ?
 							""",
 							ts, ip, row_id
@@ -173,7 +173,7 @@ def upsert_attendance_log(db: pyodbc.Connection, emp_id: str, ip: str, ts: datet
 					cur.execute(
 						"""
 						UPDATE [EmpBook_db].[dbo].[TimeAttandanceLog]
-						SET [TimeOut] = ?, [IPStampOut] = ?, [IsSend] = 0
+						SET [TimeOut] = ?, [IPStampOut] = ?
 						WHERE [Id] = ?
 						""",
 						ts, ip, row_id
@@ -185,8 +185,8 @@ def upsert_attendance_log(db: pyodbc.Connection, emp_id: str, ip: str, ts: datet
 		cur.execute(
 			"""
 			INSERT INTO [EmpBook_db].[dbo].[TimeAttandanceLog] 
-			([DateTimeStamp], [EmpId], [IPStampIn], [TimeIn], [TimeOut], [IsSend])
-			VALUES (?, ?, ?, ?, NULL, 0)
+			([DateTimeStamp], [EmpId], [IPStampIn], [TimeIn], [TimeOut])
+			VALUES (?, ?, ?, ?, NULL)
 			""",
 			ts, emp_id, ip, ts
 		)
