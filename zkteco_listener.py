@@ -131,7 +131,7 @@ def get_employee_shift(db: pyodbc.Connection, emp_id: str, ts: datetime):
 
 		cur.execute(
 			"""
-			SELECT [DatePeriod], [InTmp], [OutTmp]
+			SELECT [DatePeriod], [InTmp], [OutTmp], [HoliDay]
 			FROM [db_pfpdashboard].[dbo].[VListPeriodEmployee] WITH (NOLOCK)
 			WHERE [EmpId] = ? AND [DatePeriod] IN (?, ?)
 			ORDER BY [DatePeriod] DESC
@@ -141,7 +141,14 @@ def get_employee_shift(db: pyodbc.Connection, emp_id: str, ts: datetime):
 		rows = cur.fetchall()
 
 		for row in rows:
-			d_period, in_val, out_val = row
+			d_period, in_val, out_val, holiday = row
+			
+			# ตรวจสอบกรณีวันหยุด (HoliDay = 1 และ InTmp = 00:00)
+			# หากเข้าเงื่อนไข จะข้ามการประมวลผลกะงานนี้ เพื่อให้ระบบไปใช้การบันทึกตามเวลาจริง (Fallback)
+			is_zero_planned = str(in_val).startswith("00:00")
+			if holiday == 1 and is_zero_planned:
+				continue
+
 			if not in_val or not out_val:
 				continue
 			
@@ -285,11 +292,6 @@ def upsert_attendance_log(db: pyodbc.Connection, emp_id: str, ip: str, ts: datet
 		
 		db.commit()
 		return True
-	except Exception as e:
-		logger.error("Attendance log failed for emp=%s: %s", emp_id, e)
-		try: db.rollback()
-		except: pass
-		return False
 	except Exception as e:
 		logger.error("Attendance log failed for emp=%s: %s", emp_id, e)
 		try: db.rollback()
