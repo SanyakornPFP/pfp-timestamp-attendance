@@ -180,9 +180,10 @@ def upsert_attendance_log(db: pyodbc.Connection, emp_id: str, ip: str, ts: datet
 	
 	เงื่อนไข:
 	1. ค้นหากะงานที่ครอบคลุมเวลาที่แสกน (ts)
-	2. ตรวจสอบว่าในกะนั้นมีการบันทึก TimeIn ไปแล้วหรือยัง
-	3. ถ้ายังไม่มี -> INSERT (TimeIn)
-	4. ถ้ามีแล้ว -> UPDATE (TimeOut)
+	2. หากเป็นการแสกนครั้งแรกของกะ:
+	   - ถ้าเวลาแสกนค่อนไปทางเวลาเลิกงาน (เลยครึ่งหนึ่งของกะ) -> บันทึกเป็น TimeOut (TimeIn เป็น NULL)
+	   - ถ้าไม่ใช่ -> บันทึกเป็น TimeIn
+	3. หากมีข้อมูลของกะนี้อยู่แล้ว -> บันทึก/อัปเดต TimeOut
 	"""
 	try:
 		cur = db.cursor()
@@ -190,24 +191,21 @@ def upsert_attendance_log(db: pyodbc.Connection, emp_id: str, ip: str, ts: datet
 		# 1. ค้นหากะงาน
 		shift_date, shift_start, shift_end = get_employee_shift(db, emp_id, ts)
 
-		# 2. ค้นหา Record เดิมที่อยู่ในช่วงเวลาของกะงานนี้
+		# 2. ค้นหา Record เดิมที่อยู่ในช่วงกะงานนี้
 		if shift_date:
-			# ใช้ช่วงเวลาของกะงานเป็นเกณฑ์ในการหา Record (TimeIn ควรอยู่ใกล้ช่วงเริ่มกะ)
+			# ค้นหาโดยใช้ Employee ID และวันที่ของกะ (DateTimeStamp จะถูกบันทึกเป็นวันเริ่มกะ)
 			cur.execute(
 				"""
 				SELECT TOP 1 [Id], [TimeIn], [TimeOut]
 				FROM [EmpBook_db].[dbo].[TimeAttandanceLog] WITH (NOLOCK)
 				WHERE [EmpId] = ? 
-				  AND [TimeIn] >= ? 
-				  AND [TimeIn] <= ?
-				ORDER BY [TimeIn] DESC
+				  AND CAST([DateTimeStamp] AS DATE) = CAST(? AS DATE)
+				ORDER BY [Id] DESC
 				""",
-				emp_id, 
-				shift_start - timedelta(hours=4),
-				shift_start + timedelta(hours=14)
+				emp_id, shift_date
 			)
 		else:
-			# Fallback: กรณีไม่พบกะงาน ให้ใช้ตรรกะเดิม (หา Record ล่าสุด)
+			# Fallback: กรณีไม่พบกะงาน ให้ใช้ตรรกะหา Record ล่าสุด
 			cur.execute(
 				"""
 				SELECT TOP 1 [Id], [TimeIn], [TimeOut]
@@ -222,23 +220,25 @@ def upsert_attendance_log(db: pyodbc.Connection, emp_id: str, ip: str, ts: datet
 
 		if row:
 			row_id, first_in, last_out = row
-			diff_sec = (ts - first_in).total_seconds()
+			
+			# พิจารณาเวลาฐานสำหรับการป้องกันแสกนซ้ำ (ใช้ TimeIn ถ้ามี ถ้าไม่มีใช้ TimeOut)
+			basis_time = first_in if first_in else last_out
+			if basis_time:
+				diff_sec = (ts - basis_time).total_seconds()
+				if diff_sec < 600: # ป้องกันการแสกนซ้ำซ้อนใน 10 นาที
+					return False
 
-			# ป้องกันการแสกนซ้ำซ้อนในเวลาอันสั้น ( < 10 นาที)
-			if diff_sec < 600:
-				return False
-
-			# ถ้าเข้าเงื่อนไขว่าเคยสแกนเข้าแล้ว -> ให้บันทึกเป็นสแกนออก (Update TimeOut)
-			# รองรับทั้งการออกก่อนเวลา และการอัปเดตเวลาออกล่าสุด (ภายใน 1 ชม. หลังสแกนออกเดิม)
-			can_update = False
+			# ตัดสินใจการ Update TimeOut
+			can_update_out = False
 			if last_out is None:
-				can_update = True
+				can_update_out = True
 			else:
+				# ถ้ามีเวลาออกแล้ว แต่แสกนอีกครั้งภายใน 1 ชม. ให้ถือว่าเป็นการแก้ไขเวลาออกล่าสุด
 				diff_from_last_out = (ts - last_out).total_seconds()
-				if 0 < diff_from_last_out < 3600: # สแกนซ้ำภายใน 1 ชม. ให้ทับเวลาเดิม
-					can_update = True
+				if 0 < diff_from_last_out < 3600:
+					can_update_out = True
 
-			if can_update:
+			if can_update_out:
 				cur.execute(
 					"""
 					UPDATE [EmpBook_db].[dbo].[TimeAttandanceLog]
@@ -250,17 +250,46 @@ def upsert_attendance_log(db: pyodbc.Connection, emp_id: str, ip: str, ts: datet
 				db.commit()
 				return True
 
-		# 3. กรณีเข่างานครั้งแรกของกะ (TimeIn)
-		cur.execute(
-			"""
-			INSERT INTO [EmpBook_db].[dbo].[TimeAttandanceLog] 
-			([DateTimeStamp], [EmpId], [IPStampIn], [TimeIn], [TimeOut])
-			VALUES (?, ?, ?, ?, NULL)
-			""",
-			ts, emp_id, ip, ts
-		)
+		# 3. กรณีไม่มี Record เลย (สแกนครั้งแรกของกะ หรือ ไม่พบกะงาน)
+		# ตัดสินใจว่าเป็น In หรือ Out
+		is_timeout_only = False
+		# ถ้าพบกะงาน และเวลาที่แสกนเลยจุดกึ่งกลางกะไปแล้ว ให้บันทึกเป็นสแกนออก (เลิกงาน)
+		if shift_date and shift_start and shift_end:
+			midpoint = shift_start + (shift_end - shift_start) / 2
+			if ts > midpoint:
+				is_timeout_only = True
+			final_dt_stamp = shift_date
+		else:
+			final_dt_stamp = ts
+
+		if is_timeout_only:
+			# บันทึกเฉพาะเวลาออก (TimeIn เป็น NULL)
+			cur.execute(
+				"""
+				INSERT INTO [EmpBook_db].[dbo].[TimeAttandanceLog] 
+				([DateTimeStamp], [EmpId], [IPStampOut], [TimeIn], [TimeOut])
+				VALUES (?, ?, ?, NULL, ?)
+				""",
+				final_dt_stamp, emp_id, ip, ts
+			)
+		else:
+			# บันทึกเวลาเข้าปกติ
+			cur.execute(
+				"""
+				INSERT INTO [EmpBook_db].[dbo].[TimeAttandanceLog] 
+				([DateTimeStamp], [EmpId], [IPStampIn], [TimeIn], [TimeOut])
+				VALUES (?, ?, ?, ?, NULL)
+				""",
+				final_dt_stamp, emp_id, ip, ts
+			)
+		
 		db.commit()
 		return True
+	except Exception as e:
+		logger.error("Attendance log failed for emp=%s: %s", emp_id, e)
+		try: db.rollback()
+		except: pass
+		return False
 	except Exception as e:
 		logger.error("Attendance log failed for emp=%s: %s", emp_id, e)
 		try: db.rollback()
