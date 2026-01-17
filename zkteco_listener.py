@@ -154,13 +154,21 @@ def get_employee_shift(db: pyodbc.Connection, emp_id: str, ts: datetime):
 			
 			# แปลงเวลา (InTmp/OutTmp) เป็น datetime
 			def combine_time(d, t):
+				# แปลง d (Date) ให้เป็น datetime.date
+				if isinstance(d, str):
+					try: d = datetime.strptime(d[:10], "%Y-%m-%d").date()
+					except: return None
+				elif hasattr(d, "date"): # กรณีเป็น datetime object
+					d = d.date()
+
+				# แปลง t (Time) ให้เป็น datetime.time
 				if isinstance(t, str):
 					try: t = datetime.strptime(t[:5], "%H:%M").time()
 					except: return None
 				return datetime.combine(d, t)
 
-			shift_start = combine_time(d_period.date() if hasattr(d_period, "date") else d_period, in_val)
-			shift_end = combine_time(d_period.date() if hasattr(d_period, "date") else d_period, out_val)
+			shift_start = combine_time(d_period, in_val)
+			shift_end = combine_time(d_period, out_val)
 
 			if not shift_start or not shift_end:
 				continue
@@ -185,20 +193,62 @@ def get_employee_shift(db: pyodbc.Connection, emp_id: str, ts: datetime):
 def upsert_attendance_log(db: pyodbc.Connection, emp_id: str, ip: str, ts: datetime) -> bool:
 	"""บันทึกเวลาเข้า-ออก โดยอ้างอิงจากกะงาน (Shift-based Logic)
 	
-	เงื่อนไข:
-	1. ค้นหากะงานที่ครอบคลุมเวลาที่แสกน (ts)
-	2. หากเป็นการแสกนครั้งแรกของกะ:
-	   - ถ้าเวลาแสกนค่อนไปทางเวลาเลิกงาน (เลยครึ่งหนึ่งของกะ) -> บันทึกเป็น TimeOut (TimeIn เป็น NULL)
-	   - ถ้าไม่ใช่ -> บันทึกเป็น TimeIn
-	3. หากมีข้อมูลของกะนี้อยู่แล้ว -> บันทึก/อัปเดต TimeOut
+	เงื่อนไขเพิ่มเติม:
+	- หากพบ Record เก่าที่ยังไม่ได้แสกนออก (TimeOut IS NULL) และไม่ใช่กะปัจจุบัน
+	  จะทำการ "ปิดกะเก่า" โดยดึงเวลาเลิกงานจากแผนงานมาใส่ให้โดยอัตโนมัติ
 	"""
 	try:
 		cur = db.cursor()
 		
-		# 1. ค้นหากะงาน
+		# 1. ค้นหากะงานปัจจุบัน
 		shift_date, shift_start, shift_end = get_employee_shift(db, emp_id, ts)
 
-		# 2. ค้นหา Record เดิมที่อยู่ในช่วงกะงานนี้
+		# 2. ตรวจสอบและ "เคลียร์กะเก่าที่ค้าง" (Incomplete Record Cleanup)
+		cur.execute(
+			"""
+			SELECT TOP 1 [Id], [DateTimeStamp], [TimeIn], [TimeOut]
+			FROM [EmpBook_db].[dbo].[TimeAttandanceLog] WITH (NOLOCK)
+			WHERE [EmpId] = ?
+			ORDER BY [DateTimeStamp] DESC, [Id] DESC
+			""",
+			emp_id
+		)
+		last_rec = cur.fetchone()
+
+		if last_rec:
+			l_id, l_dt_stamp, l_in, l_out = last_rec
+			
+			# ถ้ากะล่าสุดยังไม่มีเวลาออก และ (ไม่ใช่กะเดียวกับที่กำลังแสกน หรือ ห่างเกิน 20 ชม. กรณีไม่มีกะ)
+			is_different_shift = shift_date and (l_dt_stamp.date() if hasattr(l_dt_stamp, "date") else l_dt_stamp) != (shift_date.date() if hasattr(shift_date, "date") else shift_date)
+			is_too_old = not shift_date and (ts - l_dt_stamp).total_seconds() > 20 * 3600
+			
+			if l_out is None and (is_different_shift or is_too_old):
+				# ค้นหาเวลาเลิกงานตามแผนของกะเก่านั้น
+				cur.execute(
+					"SELECT [OutTmp] FROM [db_pfpdashboard].[dbo].[VListPeriodEmployee] WHERE [EmpId] = ? AND [DatePeriod] = ?",
+					emp_id, l_dt_stamp
+				)
+				old_shift_out = cur.fetchone()
+				if old_shift_out and old_shift_out[0]:
+					# สร้าง datetime ของเวลาเลิกงานเดิม
+					try:
+						t_str = str(old_shift_out[0])[:5]
+						out_time = datetime.strptime(t_str, "%H:%M").time()
+						auto_timeout = datetime.combine(l_dt_stamp.date() if hasattr(l_dt_stamp, "date") else l_dt_stamp, out_time)
+						# ถ้าเลิกงานเช้าอีกวัน
+						if l_in and auto_timeout <= l_in:
+							auto_timeout += timedelta(days=1)
+						
+						cur.execute(
+							"UPDATE [EmpBook_db].[dbo].[TimeAttandanceLog] SET [TimeOut] = ?, [IPStampOut] = 'AUTO_CLEANUP' WHERE [Id] = ?",
+							auto_timeout, l_id
+						)
+						db.commit()
+						logger.info("Auto-closed incomplete shift for emp=%s (Record ID: %s, TimeOut: %s)", emp_id, l_id, auto_timeout)
+					except Exception as e:
+						logger.warning("Failed to auto-close shift for emp=%s: %s", emp_id, e)
+
+		# 3. ค้นหา Record เดิมที่อยู่ในช่วงกะงานนี้ (เพื่อทำการ Update TimeOut ปกติ)
 		if shift_date:
 			# ค้นหาโดยใช้ Employee ID และวันที่ของกะ (DateTimeStamp จะถูกบันทึกเป็นวันเริ่มกะ)
 			cur.execute(
@@ -232,7 +282,7 @@ def upsert_attendance_log(db: pyodbc.Connection, emp_id: str, ip: str, ts: datet
 			basis_time = first_in if first_in else last_out
 			if basis_time:
 				diff_sec = (ts - basis_time).total_seconds()
-				if diff_sec < 600: # ป้องกันการแสกนซ้ำซ้อนใน 10 นาที
+				if diff_sec < 3600: # ป้องกันการแสกนซ้ำซ้อนใน 1 ชั่วโมง
 					return False
 
 			# ตัดสินใจการ Update TimeOut
