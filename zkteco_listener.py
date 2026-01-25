@@ -226,22 +226,22 @@ def upsert_attendance_log(db: pyodbc.Connection, emp_id: str, ip: str, ts: datet
 				window_end = shift_end + timedelta(hours=8)
 				is_same_shift = window_start <= l_in <= window_end
 
-			# กรณีไม่มีกะ (shift_date=None) ให้ตรวจสอบว่า Record เก่าเกิน 20 ชม. หรือไม่
+			# กรณีไม่มีกะ (shift_date=None) ให้ตรวจสอบว่า Record เก่าเกิน 16 ชม. หรือไม่
 			is_too_old = False
 			if l_out is None:
 				ref_time = l_in if l_in else l_dt_stamp
-				is_too_old = (ts - ref_time).total_seconds() > 20 * 3600
+				is_too_old = (ts - ref_time).total_seconds() > 16 * 3600
 
 			# AUTO_CLEANUP: ตัดสินใจว่าควร cleanup หรือไม่
 			# - ถ้ามีกะ (shift_date != None): cleanup เมื่อไม่อยู่ในกะเดียวกัน
-			# - ถ้าไม่มีกะ (shift_date = None): cleanup เมื่อ Record เก่าเกิน 20 ชม.
+			# - ถ้าไม่มีกะ (shift_date = None): cleanup เมื่อ Record เก่าเกิน 16 ชม.
 			should_cleanup = False
 			if l_out is None:
 				if shift_date:
 					# มีกะ → cleanup ถ้าไม่อยู่ในกะเดียวกัน
 					should_cleanup = not is_same_shift
 				else:
-					# ไม่มีกะ → cleanup ถ้าเก่าเกิน 20 ชม.
+					# ไม่มีกะ → cleanup ถ้าเก่าเกิน 16 ชม.
 					should_cleanup = is_too_old
 
 			if should_cleanup:
@@ -377,6 +377,94 @@ def upsert_attendance_log(db: pyodbc.Connection, emp_id: str, ip: str, ts: datet
 		return False
 
 
+def global_auto_cleanup(db: pyodbc.Connection):
+	"""ตรวจสอบ Record ทั้งหมดใน TimeAttandanceLog ที่ไม่มีเวลาออก (TimeOut IS NULL)
+	หากเวลาผ่านไปนานกว่า 16 ชม. จะทำการ AUTO_CLEANUP
+	"""
+	try:
+		cur = db.cursor()
+		# กำหนดเกณฑ์เวลา 16 ชั่วโมงที่แล้ว
+		threshold_time = datetime.now() - timedelta(hours=16)
+
+		# ค้นหา Record ที่ค้าง (TimeOut เป็น NULL) และเก่ากว่า 16 ชม.
+		cur.execute(
+			"""
+			SELECT [Id], [EmpId], [DateTimeStamp], [TimeIn]
+			FROM [EmpBook_db].[dbo].[TimeAttandanceLog] WITH (NOLOCK)
+			WHERE [TimeOut] IS NULL
+			  AND (
+				([TimeIn] IS NOT NULL AND [TimeIn] < ?)
+				OR
+				([TimeIn] IS NULL AND [DateTimeStamp] < ?)
+			  )
+			""",
+			threshold_time, threshold_time
+		)
+		records = cur.fetchall()
+
+		if not records:
+			return
+
+		logger.info("Global cleanup: Found %d incomplete records older than 16h.", len(records))
+
+		for row in records:
+			r_id, emp_id, dt_stamp, t_in = row
+			ref_time = t_in if t_in else dt_stamp
+			
+			# ค่า Default สำหรับ TimeOut คือเวลาเดียวกับ TimeIn (เพื่อให้ Record สมบูรณ์ แต่ระยะเวลาเป็น 0)
+			auto_timeout = ref_time
+
+			# พยายามหาแผนงาน (Shift) เพื่อดึงเวลาเลิกงานจริงมาใส่
+			try:
+				dt_period = dt_stamp.date() if hasattr(dt_stamp, "date") else dt_stamp
+				cur.execute(
+					"SELECT TOP 1 [OutTmp] FROM [db_pfpdashboard].[dbo].[VListPeriodEmployee] WITH (NOLOCK) WHERE [EmpId] = ? AND [DatePeriod] = ?",
+					emp_id, dt_period
+				)
+				shift_row = cur.fetchone()
+				if shift_row and shift_row[0]:
+					t_str = str(shift_row[0])[:5] # "HH:mm"
+					out_time = datetime.strptime(t_str, "%H:%M").time()
+					base_date = dt_stamp.date() if hasattr(dt_stamp, "date") else dt_stamp
+					auto_timeout = datetime.combine(base_date, out_time)
+
+					# กรณีข้ามวัน
+					if t_in and auto_timeout <= t_in:
+						auto_timeout += timedelta(days=1)
+			except Exception as e:
+				logger.debug("Shift lookup failed during cleanup for record %s: %s", r_id, e)
+
+			# อัปเดตข้อมูล
+			cur.execute(
+				"UPDATE [EmpBook_db].[dbo].[TimeAttandanceLog] SET [TimeOut] = ?, [IPStampOut] = 'AUTO_CLEANUP' WHERE [Id] = ?",
+				auto_timeout, r_id
+			)
+			db.commit()
+			logger.info("Global cleanup: Record ID %s (Emp: %s) auto-closed with TimeOut: %s", r_id, emp_id, auto_timeout)
+
+	except Exception as e:
+		logger.error("Global cleanup failed: %s", e)
+		try: db.rollback()
+		except: pass
+
+
+def run_cleanup_worker():
+	"""Thread สำหรับรัน global_auto_cleanup เป็นระยะๆ"""
+	logger.info("Cleanup worker started.")
+	while not STOP_EVENT.is_set():
+		db_conn = _open_sql_connection()
+		if db_conn:
+			global_auto_cleanup(db_conn)
+			db_conn.close()
+		
+		# รอ 1 ชม. (เช็ค STOP_EVENT ทุก 10 วินาที เพื่อให้ปิด thread ได้เร็วขึ้น)
+		for _ in range(360): 
+			if STOP_EVENT.is_set():
+				break
+			STOP_EVENT.wait(10)
+	logger.info("Cleanup worker stopped.")
+
+
 def run_live_capture(device: Device, port: int) -> None:
 	"""Connect to a ZKTeco device and stream live attendance events.
 
@@ -478,6 +566,12 @@ def main():
 				", ".join(f"{d.name}({d.ip})" for d in devices))
 
 	threads: List[threading.Thread] = []
+	
+	# Start Cleanup Worker Thread
+	cleanup_t = threading.Thread(target=run_cleanup_worker, name="CleanupWorker", daemon=True)
+	threads.append(cleanup_t)
+	cleanup_t.start()
+
 	for device in devices:
 		t = threading.Thread(
 			target=run_live_capture, args=(device, port), name=f"LiveCapture-{device.ip}", daemon=True
