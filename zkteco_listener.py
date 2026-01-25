@@ -217,12 +217,34 @@ def upsert_attendance_log(db: pyodbc.Connection, emp_id: str, ip: str, ts: datet
 
 		if last_rec:
 			l_id, l_dt_stamp, l_in, l_out = last_rec
-			
-			# ถ้ากะล่าสุดยังไม่มีเวลาออก และ (ไม่ใช่กะเดียวกับที่กำลังแสกน หรือ ห่างเกิน 20 ชม. กรณีไม่มีกะ)
-			is_different_shift = shift_date and (l_dt_stamp.date() if hasattr(l_dt_stamp, "date") else l_dt_stamp) != (shift_date.date() if hasattr(shift_date, "date") else shift_date)
-			is_too_old = not shift_date and (ts - l_dt_stamp).total_seconds() > 20 * 3600
-			
-			if l_out is None and (is_different_shift or is_too_old):
+
+			# ตรวจสอบว่า Record เดิมอยู่ในกะปัจจุบันหรือไม่ โดยใช้ TimeIn (เวลาจริงที่แสกน)
+			# แทนการเปรียบเทียบ DateTimeStamp ซึ่งอาจทำให้เกิดปัญหา type mismatch
+			is_same_shift = False
+			if l_in and shift_start and shift_end:
+				window_start = shift_start - timedelta(hours=4)
+				window_end = shift_end + timedelta(hours=8)
+				is_same_shift = window_start <= l_in <= window_end
+
+			# กรณีไม่มีกะ (shift_date=None) ให้ตรวจสอบว่า Record เก่าเกิน 20 ชม. หรือไม่
+			is_too_old = False
+			if l_out is None:
+				ref_time = l_in if l_in else l_dt_stamp
+				is_too_old = (ts - ref_time).total_seconds() > 20 * 3600
+
+			# AUTO_CLEANUP: ตัดสินใจว่าควร cleanup หรือไม่
+			# - ถ้ามีกะ (shift_date != None): cleanup เมื่อไม่อยู่ในกะเดียวกัน
+			# - ถ้าไม่มีกะ (shift_date = None): cleanup เมื่อ Record เก่าเกิน 20 ชม.
+			should_cleanup = False
+			if l_out is None:
+				if shift_date:
+					# มีกะ → cleanup ถ้าไม่อยู่ในกะเดียวกัน
+					should_cleanup = not is_same_shift
+				else:
+					# ไม่มีกะ → cleanup ถ้าเก่าเกิน 20 ชม.
+					should_cleanup = is_too_old
+
+			if should_cleanup:
 				# ค้นหาเวลาเลิกงานตามแผนของกะเก่านั้น
 				cur.execute(
 					"SELECT [OutTmp] FROM [db_pfpdashboard].[dbo].[VListPeriodEmployee] WHERE [EmpId] = ? AND [DatePeriod] = ?",
@@ -253,9 +275,9 @@ def upsert_attendance_log(db: pyodbc.Connection, emp_id: str, ip: str, ts: datet
 			# ค้นหาโดยใช้ Employee ID และวันที่ของกะ (DateTimeStamp จะถูกบันทึกเป็นวันเริ่มกะ)
 			cur.execute(
 				"""
-				SELECT TOP 1 [Id], [TimeIn], [TimeOut]
+				SELECT TOP 1 [Id], [TimeIn], [TimeOut], [IPStampOut]
 				FROM [EmpBook_db].[dbo].[TimeAttandanceLog] WITH (NOLOCK)
-				WHERE [EmpId] = ? 
+				WHERE [EmpId] = ?
 				  AND CAST([DateTimeStamp] AS DATE) = CAST(? AS DATE)
 				ORDER BY [Id] DESC
 				""",
@@ -265,19 +287,19 @@ def upsert_attendance_log(db: pyodbc.Connection, emp_id: str, ip: str, ts: datet
 			# Fallback: กรณีไม่พบกะงาน ให้ใช้ตรรกะหา Record ล่าสุด
 			cur.execute(
 				"""
-				SELECT TOP 1 [Id], [TimeIn], [TimeOut]
+				SELECT TOP 1 [Id], [TimeIn], [TimeOut], [IPStampOut]
 				FROM [EmpBook_db].[dbo].[TimeAttandanceLog] WITH (NOLOCK)
 				WHERE [EmpId] = ?
 				ORDER BY [DateTimeStamp] DESC
 				""",
 				emp_id
 			)
-		
+
 		row = cur.fetchone()
 
 		if row:
-			row_id, first_in, last_out = row
-			
+			row_id, first_in, last_out, ip_stamp_out = row
+
 			# พิจารณาเวลาฐานสำหรับการป้องกันแสกนซ้ำ (ใช้ TimeIn ถ้ามี ถ้าไม่มีใช้ TimeOut)
 			basis_time = first_in if first_in else last_out
 			if basis_time:
@@ -288,6 +310,12 @@ def upsert_attendance_log(db: pyodbc.Connection, emp_id: str, ip: str, ts: datet
 			# ตัดสินใจการ Update TimeOut
 			can_update_out = False
 			if last_out is None:
+				can_update_out = True
+			elif ip_stamp_out == 'AUTO_CLEANUP':
+				# ถ้า TimeOut ถูก AUTO_CLEANUP มา อนุญาตให้ overwrite ด้วยเวลาจริง
+				can_update_out = True
+			elif last_out > ts:
+				# TimeOut เป็นอนาคต (อาจถูก AUTO_CLEANUP) → อนุญาตให้ update
 				can_update_out = True
 			else:
 				# ถ้ามีเวลาออกแล้ว แต่แสกนอีกครั้งภายใน 1 ชม. ให้ถือว่าเป็นการแก้ไขเวลาออกล่าสุด
