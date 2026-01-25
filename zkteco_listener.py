@@ -120,55 +120,349 @@ def _normalize_user_id(user_id: Optional[Union[str, int]]) -> Optional[str]:
 	return s
 
 
-def upsert_worktime_alert_if_needed(db: pyodbc.Connection, emp_id, ip: str, ts: datetime) -> bool:
-	"""Insert a row into WorkTimeAlert if last scan for today is >= 10 minutes ago.
-
-	Returns True if inserted, False if skipped.
+def get_employee_shift(db: pyodbc.Connection, emp_id: str, ts: datetime):
+	"""ดึงข้อมูลกะงานจาก [db_pfpdashboard].[dbo].[VListPeriodEmployee]
+	ตรวจสอบทั้งวันนี้และเมื่อวานเพื่อรองรับกะงานข้ามคืน
 	"""
 	try:
 		cur = db.cursor()
-		# Get latest record for this employee and device today
+		date_today = ts.date()
+		date_yesterday = date_today - timedelta(days=1)
+
 		cur.execute(
 			"""
-			SELECT TOP 1 [DateTimeStamp]
-			FROM [EmpBook_db].[dbo].[WorkTimeAlert] WITH (NOLOCK)
-			WHERE [EmpId] = ? AND [IPStamp] = ? AND CAST([DateTimeStamp] AS date) = CAST(? AS date)
-			ORDER BY [DateTimeStamp] DESC
+			SELECT [DatePeriod], [InTmp], [OutTmp], [HoliDay]
+			FROM [db_pfpdashboard].[dbo].[VListPeriodEmployee] WITH (NOLOCK)
+			WHERE [EmpId] = ? AND [DatePeriod] IN (?, ?)
+			ORDER BY [DatePeriod] DESC
 			""",
-			emp_id, ip, ts
+			emp_id, date_today, date_yesterday
 		)
+		rows = cur.fetchall()
+
+		for row in rows:
+			d_period, in_val, out_val, holiday = row
+			
+			# ตรวจสอบกรณีวันหยุด (HoliDay = 1 และ InTmp = 00:00)
+			# หากเข้าเงื่อนไข จะข้ามการประมวลผลกะงานนี้ เพื่อให้ระบบไปใช้การบันทึกตามเวลาจริง (Fallback)
+			is_zero_planned = str(in_val).startswith("00:00")
+			if holiday == 1 and is_zero_planned:
+				continue
+
+			if not in_val or not out_val:
+				continue
+			
+			# แปลงเวลา (InTmp/OutTmp) เป็น datetime
+			def combine_time(d, t):
+				# แปลง d (Date) ให้เป็น datetime.date
+				if isinstance(d, str):
+					try: d = datetime.strptime(d[:10], "%Y-%m-%d").date()
+					except: return None
+				elif hasattr(d, "date"): # กรณีเป็น datetime object
+					d = d.date()
+
+				# แปลง t (Time) ให้เป็น datetime.time
+				if isinstance(t, str):
+					try: t = datetime.strptime(t[:5], "%H:%M").time()
+					except: return None
+				return datetime.combine(d, t)
+
+			shift_start = combine_time(d_period, in_val)
+			shift_end = combine_time(d_period, out_val)
+
+			if not shift_start or not shift_end:
+				continue
+
+			# กรณีดึก (เช่น 22:00 - 06:00)
+			if shift_end <= shift_start:
+				shift_end += timedelta(days=1)
+
+			# กำหนดช่วงเวลา (Window) ที่อนุญาตให้บันทึกในกะนี้ (เช่น ก่อนสแกนเข้า 4 ชม. ถึง หลังสแกนออก 8 ชม.)
+			window_start = shift_start - timedelta(hours=4)
+			window_end = shift_end + timedelta(hours=8)
+
+			if window_start <= ts <= window_end:
+				return d_period, shift_start, shift_end
+
+		return None, None, None
+	except Exception as e:
+		logger.error("Fetch shift failed for %s: %s", emp_id, e)
+		return None, None, None
+
+
+def upsert_attendance_log(db: pyodbc.Connection, emp_id: str, ip: str, ts: datetime) -> bool:
+	"""บันทึกเวลาเข้า-ออก โดยอ้างอิงจากกะงาน (Shift-based Logic)
+	
+	เงื่อนไขเพิ่มเติม:
+	- หากพบ Record เก่าที่ยังไม่ได้แสกนออก (TimeOut IS NULL) และไม่ใช่กะปัจจุบัน
+	  จะทำการ "ปิดกะเก่า" โดยดึงเวลาเลิกงานจากแผนงานมาใส่ให้โดยอัตโนมัติ
+	"""
+	try:
+		cur = db.cursor()
+		
+		# 1. ค้นหากะงานปัจจุบัน
+		shift_date, shift_start, shift_end = get_employee_shift(db, emp_id, ts)
+
+		# 2. ตรวจสอบและ "เคลียร์กะเก่าที่ค้าง" (Incomplete Record Cleanup)
+		cur.execute(
+			"""
+			SELECT TOP 1 [Id], [DateTimeStamp], [TimeIn], [TimeOut]
+			FROM [EmpBook_db].[dbo].[TimeAttandanceLog] WITH (NOLOCK)
+			WHERE [EmpId] = ?
+			ORDER BY [DateTimeStamp] DESC, [Id] DESC
+			""",
+			emp_id
+		)
+		last_rec = cur.fetchone()
+
+		if last_rec:
+			l_id, l_dt_stamp, l_in, l_out = last_rec
+
+			# ตรวจสอบว่า Record เดิมอยู่ในกะปัจจุบันหรือไม่ โดยใช้ TimeIn (เวลาจริงที่แสกน)
+			# แทนการเปรียบเทียบ DateTimeStamp ซึ่งอาจทำให้เกิดปัญหา type mismatch
+			is_same_shift = False
+			if l_in and shift_start and shift_end:
+				window_start = shift_start - timedelta(hours=4)
+				window_end = shift_end + timedelta(hours=8)
+				is_same_shift = window_start <= l_in <= window_end
+
+			# กรณีไม่มีกะ (shift_date=None) ให้ตรวจสอบว่า Record เก่าเกิน 16 ชม. หรือไม่
+			is_too_old = False
+			if l_out is None:
+				ref_time = l_in if l_in else l_dt_stamp
+				is_too_old = (ts - ref_time).total_seconds() > 16 * 3600
+
+			# AUTO_CLEANUP: ตัดสินใจว่าควร cleanup หรือไม่
+			# - ถ้ามีกะ (shift_date != None): cleanup เมื่อไม่อยู่ในกะเดียวกัน
+			# - ถ้าไม่มีกะ (shift_date = None): cleanup เมื่อ Record เก่าเกิน 16 ชม.
+			should_cleanup = False
+			if l_out is None:
+				if shift_date:
+					# มีกะ → cleanup ถ้าไม่อยู่ในกะเดียวกัน
+					should_cleanup = not is_same_shift
+				else:
+					# ไม่มีกะ → cleanup ถ้าเก่าเกิน 16 ชม.
+					should_cleanup = is_too_old
+
+			if should_cleanup:
+				# ค้นหาเวลาเลิกงานตามแผนของกะเก่านั้น
+				cur.execute(
+					"SELECT [OutTmp] FROM [db_pfpdashboard].[dbo].[VListPeriodEmployee] WHERE [EmpId] = ? AND [DatePeriod] = ?",
+					emp_id, l_dt_stamp
+				)
+				old_shift_out = cur.fetchone()
+				if old_shift_out and old_shift_out[0]:
+					# สร้าง datetime ของเวลาเลิกงานเดิม
+					try:
+						t_str = str(old_shift_out[0])[:5]
+						out_time = datetime.strptime(t_str, "%H:%M").time()
+						auto_timeout = datetime.combine(l_dt_stamp.date() if hasattr(l_dt_stamp, "date") else l_dt_stamp, out_time)
+						# ถ้าเลิกงานเช้าอีกวัน
+						if l_in and auto_timeout <= l_in:
+							auto_timeout += timedelta(days=1)
+						
+						cur.execute(
+							"UPDATE [EmpBook_db].[dbo].[TimeAttandanceLog] SET [TimeOut] = ?, [IPStampOut] = 'AUTO_CLEANUP' WHERE [Id] = ?",
+							auto_timeout, l_id
+						)
+						db.commit()
+						logger.info("Auto-closed incomplete shift for emp=%s (Record ID: %s, TimeOut: %s)", emp_id, l_id, auto_timeout)
+					except Exception as e:
+						logger.warning("Failed to auto-close shift for emp=%s: %s", emp_id, e)
+
+		# 3. ค้นหา Record เดิมที่อยู่ในช่วงกะงานนี้ (เพื่อทำการ Update TimeOut ปกติ)
+		if shift_date:
+			# ค้นหาโดยใช้ Employee ID และวันที่ของกะ (DateTimeStamp จะถูกบันทึกเป็นวันเริ่มกะ)
+			cur.execute(
+				"""
+				SELECT TOP 1 [Id], [TimeIn], [TimeOut], [IPStampOut]
+				FROM [EmpBook_db].[dbo].[TimeAttandanceLog] WITH (NOLOCK)
+				WHERE [EmpId] = ?
+				  AND CAST([DateTimeStamp] AS DATE) = CAST(? AS DATE)
+				ORDER BY [Id] DESC
+				""",
+				emp_id, shift_date
+			)
+		else:
+			# Fallback: กรณีไม่พบกะงาน ให้ใช้ตรรกะหา Record ล่าสุด
+			cur.execute(
+				"""
+				SELECT TOP 1 [Id], [TimeIn], [TimeOut], [IPStampOut]
+				FROM [EmpBook_db].[dbo].[TimeAttandanceLog] WITH (NOLOCK)
+				WHERE [EmpId] = ?
+				ORDER BY [DateTimeStamp] DESC
+				""",
+				emp_id
+			)
+
 		row = cur.fetchone()
-		if row and row[0]:
-			last_ts = row[0]
-			# pyodbc returns datetime already; ensure type
-			if not isinstance(last_ts, datetime):
-				try:
-					last_ts = datetime.fromisoformat(str(last_ts))
-				except Exception:
-					last_ts = None
-			if last_ts is not None:
-				diff_sec = (ts - last_ts).total_seconds()
-				if diff_sec < 600:
-					# Less than 10 minutes, skip insert
+
+		if row:
+			row_id, first_in, last_out, ip_stamp_out = row
+
+			# พิจารณาเวลาฐานสำหรับการป้องกันแสกนซ้ำ (ใช้ TimeIn ถ้ามี ถ้าไม่มีใช้ TimeOut)
+			basis_time = first_in if first_in else last_out
+			if basis_time:
+				diff_sec = (ts - basis_time).total_seconds()
+				if diff_sec < 3600: # ป้องกันการแสกนซ้ำซ้อนใน 1 ชั่วโมง
 					return False
 
-		# Insert new alert
-		cur.execute(
-			"""
-			INSERT INTO [EmpBook_db].[dbo].[WorkTimeAlert] ([DateTimeStamp],[EmpId],[IPStamp],[IsSend])
-			VALUES (?,?,?,0)
-			""",
-			ts, emp_id, ip
-		)
+			# ตัดสินใจการ Update TimeOut
+			can_update_out = False
+			if last_out is None:
+				can_update_out = True
+			elif ip_stamp_out == 'AUTO_CLEANUP':
+				# ถ้า TimeOut ถูก AUTO_CLEANUP มา อนุญาตให้ overwrite ด้วยเวลาจริง
+				can_update_out = True
+			elif last_out > ts:
+				# TimeOut เป็นอนาคต (อาจถูก AUTO_CLEANUP) → อนุญาตให้ update
+				can_update_out = True
+			else:
+				# ถ้ามีเวลาออกแล้ว แต่แสกนอีกครั้งภายใน 1 ชม. ให้ถือว่าเป็นการแก้ไขเวลาออกล่าสุด
+				diff_from_last_out = (ts - last_out).total_seconds()
+				if 0 < diff_from_last_out < 3600:
+					can_update_out = True
+
+			if can_update_out:
+				cur.execute(
+					"""
+					UPDATE [EmpBook_db].[dbo].[TimeAttandanceLog]
+					SET [TimeOut] = ?, [IPStampOut] = ?
+					WHERE [Id] = ?
+					""",
+					ts, ip, row_id
+				)
+				db.commit()
+				return True
+
+		# 3. กรณีไม่มี Record เลย (สแกนครั้งแรกของกะ หรือ ไม่พบกะงาน)
+		# ตัดสินใจว่าเป็น In หรือ Out
+		is_timeout_only = False
+		# ถ้าพบกะงาน และเวลาที่แสกนเลยจุดกึ่งกลางกะไปแล้ว ให้บันทึกเป็นสแกนออก (เลิกงาน)
+		if shift_date and shift_start and shift_end:
+			midpoint = shift_start + (shift_end - shift_start) / 2
+			if ts > midpoint:
+				is_timeout_only = True
+			final_dt_stamp = shift_date
+		else:
+			final_dt_stamp = ts
+
+		if is_timeout_only:
+			# บันทึกเฉพาะเวลาออก (TimeIn เป็น NULL)
+			cur.execute(
+				"""
+				INSERT INTO [EmpBook_db].[dbo].[TimeAttandanceLog] 
+				([DateTimeStamp], [EmpId], [IPStampOut], [TimeIn], [TimeOut])
+				VALUES (?, ?, ?, NULL, ?)
+				""",
+				final_dt_stamp, emp_id, ip, ts
+			)
+		else:
+			# บันทึกเวลาเข้าปกติ
+			cur.execute(
+				"""
+				INSERT INTO [EmpBook_db].[dbo].[TimeAttandanceLog] 
+				([DateTimeStamp], [EmpId], [IPStampIn], [TimeIn], [TimeOut])
+				VALUES (?, ?, ?, ?, NULL)
+				""",
+				final_dt_stamp, emp_id, ip, ts
+			)
+		
 		db.commit()
 		return True
 	except Exception as e:
-		logger.error("WorkTimeAlert insert check failed for emp=%s ip=%s: %s", emp_id, ip, e)
-		try:
-			db.rollback()
-		except Exception:
-			pass
+		logger.error("Attendance log failed for emp=%s: %s", emp_id, e)
+		try: db.rollback()
+		except: pass
 		return False
+
+
+def global_auto_cleanup(db: pyodbc.Connection):
+	"""ตรวจสอบ Record ทั้งหมดใน TimeAttandanceLog ที่ไม่มีเวลาออก (TimeOut IS NULL)
+	หากเวลาผ่านไปนานกว่า 16 ชม. จะทำการ AUTO_CLEANUP
+	"""
+	try:
+		cur = db.cursor()
+		# กำหนดเกณฑ์เวลา 16 ชั่วโมงที่แล้ว
+		threshold_time = datetime.now() - timedelta(hours=16)
+
+		# ค้นหา Record ที่ค้าง (TimeOut เป็น NULL) และเก่ากว่า 16 ชม.
+		cur.execute(
+			"""
+			SELECT [Id], [EmpId], [DateTimeStamp], [TimeIn]
+			FROM [EmpBook_db].[dbo].[TimeAttandanceLog] WITH (NOLOCK)
+			WHERE [TimeOut] IS NULL
+			  AND (
+				([TimeIn] IS NOT NULL AND [TimeIn] < ?)
+				OR
+				([TimeIn] IS NULL AND [DateTimeStamp] < ?)
+			  )
+			""",
+			threshold_time, threshold_time
+		)
+		records = cur.fetchall()
+
+		if not records:
+			return
+
+		logger.info("Global cleanup: Found %d incomplete records older than 16h.", len(records))
+
+		for row in records:
+			r_id, emp_id, dt_stamp, t_in = row
+			ref_time = t_in if t_in else dt_stamp
+			
+			# ค่า Default สำหรับ TimeOut คือเวลาเดียวกับ TimeIn (เพื่อให้ Record สมบูรณ์ แต่ระยะเวลาเป็น 0)
+			auto_timeout = ref_time
+
+			# พยายามหาแผนงาน (Shift) เพื่อดึงเวลาเลิกงานจริงมาใส่
+			try:
+				dt_period = dt_stamp.date() if hasattr(dt_stamp, "date") else dt_stamp
+				cur.execute(
+					"SELECT TOP 1 [OutTmp] FROM [db_pfpdashboard].[dbo].[VListPeriodEmployee] WITH (NOLOCK) WHERE [EmpId] = ? AND [DatePeriod] = ?",
+					emp_id, dt_period
+				)
+				shift_row = cur.fetchone()
+				if shift_row and shift_row[0]:
+					t_str = str(shift_row[0])[:5] # "HH:mm"
+					out_time = datetime.strptime(t_str, "%H:%M").time()
+					base_date = dt_stamp.date() if hasattr(dt_stamp, "date") else dt_stamp
+					auto_timeout = datetime.combine(base_date, out_time)
+
+					# กรณีข้ามวัน
+					if t_in and auto_timeout <= t_in:
+						auto_timeout += timedelta(days=1)
+			except Exception as e:
+				logger.debug("Shift lookup failed during cleanup for record %s: %s", r_id, e)
+
+			# อัปเดตข้อมูล
+			cur.execute(
+				"UPDATE [EmpBook_db].[dbo].[TimeAttandanceLog] SET [TimeOut] = ?, [IPStampOut] = 'AUTO_CLEANUP' WHERE [Id] = ?",
+				auto_timeout, r_id
+			)
+			db.commit()
+			logger.info("Global cleanup: Record ID %s (Emp: %s) auto-closed with TimeOut: %s", r_id, emp_id, auto_timeout)
+
+	except Exception as e:
+		logger.error("Global cleanup failed: %s", e)
+		try: db.rollback()
+		except: pass
+
+
+def run_cleanup_worker():
+	"""Thread สำหรับรัน global_auto_cleanup เป็นระยะๆ"""
+	logger.info("Cleanup worker started.")
+	while not STOP_EVENT.is_set():
+		db_conn = _open_sql_connection()
+		if db_conn:
+			global_auto_cleanup(db_conn)
+			db_conn.close()
+		
+		# รอ 1 ชม. (เช็ค STOP_EVENT ทุก 10 วินาที เพื่อให้ปิด thread ได้เร็วขึ้น)
+		for _ in range(360): 
+			if STOP_EVENT.is_set():
+				break
+			STOP_EVENT.wait(10)
+	logger.info("Cleanup worker stopped.")
 
 
 def run_live_capture(device: Device, port: int) -> None:
@@ -212,14 +506,14 @@ def run_live_capture(device: Device, port: int) -> None:
 			# Only log when it's a real attendance
 			logger.info("LiveCapture %s: <Attendance>: %s : %s (%s, %s)", device.ip, user_id, timestamp, status, punch)
 
-			# Insert into WorkTimeAlert with 10-minute spacing
+			# Insert into TimeAttandanceLog
 			if db_conn is not None and user_id is not None:
 				ts_dt = _parse_attendance_timestamp(timestamp) or datetime.now()
-				inserted = upsert_worktime_alert_if_needed(db_conn, user_id, device.ip, ts_dt)
+				inserted = upsert_attendance_log(db_conn, user_id, device.ip, ts_dt)
 				if inserted:
-					logger.debug("Inserted WorkTimeAlert for emp=%s ip=%s at %s", user_id, device.ip, ts_dt)
+					logger.info("Processed attendance for emp=%s at %s", user_id, ts_dt)
 				else:
-					logger.debug("Skipped insert (within 10 minutes) for emp=%s ip=%s", user_id, device.ip)
+					logger.debug("Skipped or updated (duplicate/threshold) for emp=%s", user_id)
 	except KeyboardInterrupt:
 		pass
 	except Exception as e:
@@ -272,6 +566,12 @@ def main():
 				", ".join(f"{d.name}({d.ip})" for d in devices))
 
 	threads: List[threading.Thread] = []
+	
+	# Start Cleanup Worker Thread
+	cleanup_t = threading.Thread(target=run_cleanup_worker, name="CleanupWorker", daemon=True)
+	threads.append(cleanup_t)
+	cleanup_t.start()
+
 	for device in devices:
 		t = threading.Thread(
 			target=run_live_capture, args=(device, port), name=f"LiveCapture-{device.ip}", daemon=True
@@ -299,4 +599,3 @@ def main():
 
 if __name__ == "__main__":
 	sys.exit(main())
-
