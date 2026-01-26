@@ -28,6 +28,9 @@ STOP_EVENT = threading.Event()
 # Load environment variables from .env if present
 load_dotenv()
 
+# ตั้งค่าให้สามารถปิด built-in cleanup worker ได้ (เมื่อใช้ cleanup_service.py แยก)
+ENABLE_BUILTIN_CLEANUP = os.getenv("ENABLE_BUILTIN_CLEANUP", "true").lower() in ("true", "1", "yes")
+
 
 def _choose_sql_driver(env_driver: Optional[str] = None) -> Optional[str]:
 	available_drivers = [d for d in pyodbc.drivers() if d and d.strip()]
@@ -566,11 +569,15 @@ def main():
 				", ".join(f"{d.name}({d.ip})" for d in devices))
 
 	threads: List[threading.Thread] = []
-	
-	# Start Cleanup Worker Thread
-	cleanup_t = threading.Thread(target=run_cleanup_worker, name="CleanupWorker", daemon=True)
-	threads.append(cleanup_t)
-	cleanup_t.start()
+
+	# Start Cleanup Worker Thread (ถ้าเปิดใช้งาน)
+	if ENABLE_BUILTIN_CLEANUP:
+		cleanup_t = threading.Thread(target=run_cleanup_worker, name="CleanupWorker", daemon=True)
+		threads.append(cleanup_t)
+		cleanup_t.start()
+		logger.info("Built-in cleanup worker enabled.")
+	else:
+		logger.info("Built-in cleanup worker disabled. Use cleanup_service.py separately.")
 
 	for device in devices:
 		t = threading.Thread(

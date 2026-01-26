@@ -3,7 +3,7 @@ services:
   zkteco-listener:
     build: .
     image: timestamp-attendance:latest
-    container_name: timestamp-attendance
+    container_name: zkteco_listener-service
     restart: unless-stopped
     env_file:
       - .env
@@ -13,8 +13,27 @@ services:
       - MSSQL_USER
       - MSSQL_PASSWORD
       - MSSQL_ODBC_DRIVER
+      - ENABLE_BUILTIN_CLEANUP=false
     network_mode: bridge
     volumes:
       - ./:/app
     stdin_open: true
     tty: true
+
+  cleanup-service:
+    build: .
+    image: timestamp-attendance:latest
+    container_name: cleanup-service
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      - MSSQL_SERVER
+      - MSSQL_DATABASE
+      - MSSQL_USER
+      - MSSQL_PASSWORD
+      - MSSQL_ODBC_DRIVER
+      - CLEANUP_INTERVAL_SECONDS=14400
+      - CLEANUP_THRESHOLD_HOURS=16
+    network_mode: bridge
+    command: ["python", "cleanup_service.py"]
