@@ -471,68 +471,76 @@ def run_cleanup_worker():
 def run_live_capture(device: Device, port: int) -> None:
 	"""Connect to a ZKTeco device and stream live attendance events.
 
-	Only uses the live_capture() generator. Runs until STOP_EVENT is set.
+	Runs in a loop to automatically reconnect if the connection is lost.
+	Runs until STOP_EVENT is set.
 	"""
-	zk = ZK(
-		device.ip,
-		port=port,
-		timeout=10,
-		password=0,
-		force_udp=False,
-		ommit_ping=False,
-	)
-	conn = None
-	db_conn = None
-	try:
-		logger.info("Connecting to device '%s' (%s:%d)", device.name, device.ip, port)
-		conn = zk.connect()
-		logger.info("Connected: %s (%s)", device.name, device.ip)
-		# Open a DB connection for this thread
-		db_conn = _open_sql_connection()
-		if db_conn is None:
-			logger.error("DB connection unavailable; live capture will still run but inserts disabled.")
-
-		# live_capture is a generator producing attendance events continuously
-		for attendance in conn.live_capture():
-			if STOP_EVENT.is_set():
-				break
-			# Skip empty / heartbeat messages (None)
-			if attendance is None:
-				continue
-			# Safely extract attributes (pyzk Attendance object can vary by device)
-			user_id_raw = getattr(attendance, 'user_id', getattr(attendance, 'uid', None))
-			user_id = _normalize_user_id(user_id_raw)
-			timestamp = getattr(attendance, 'timestamp', getattr(attendance, 'time', None))
-			status = getattr(attendance, 'status', None)
-			punch = getattr(attendance, 'punch', getattr(attendance, 'type', None))
-			# Format similar to requested example
-			# Only log when it's a real attendance
-			logger.info("LiveCapture %s: <Attendance>: %s : %s (%s, %s)", device.ip, user_id, timestamp, status, punch)
-
-			# Insert into TimeAttandanceLog
-			if db_conn is not None and user_id is not None:
-				ts_dt = _parse_attendance_timestamp(timestamp) or datetime.now()
-				inserted = upsert_attendance_log(db_conn, user_id, device.ip, ts_dt)
-				if inserted:
-					logger.info("Processed attendance for emp=%s at %s", user_id, ts_dt)
-				else:
-					logger.debug("Skipped or updated (duplicate/threshold) for emp=%s", user_id)
-	except KeyboardInterrupt:
-		pass
-	except Exception as e:
-		logger.error("Device %s (%s) error: %s", device.name, device.ip, e)
-	finally:
+	while not STOP_EVENT.is_set():
+		zk = ZK(
+			device.ip,
+			port=port,
+			timeout=10,
+			password=0,
+			force_udp=False,
+			ommit_ping=False,
+		)
+		conn = None
+		db_conn = None
 		try:
-			if conn:
-				conn.disconnect()
-		except Exception:
-			pass
-		try:
-			if db_conn:
-				db_conn.close()
-		except Exception:
-			pass
-		logger.info("Disconnected from %s (%s)", device.name, device.ip)
+			logger.info("Connecting to device '%s' (%s:%d)", device.name, device.ip, port)
+			conn = zk.connect()
+			logger.info("Connected to %s (%s)", device.name, device.ip)
+			
+			# Open a DB connection for this thread
+			db_conn = _open_sql_connection()
+			if db_conn is None:
+				logger.error("DB connection unavailable for %s; live capture will run but SQL inserts disabled.", device.ip)
+
+			# live_capture is a generator producing attendance events continuously
+			for attendance in conn.live_capture():
+				if STOP_EVENT.is_set():
+					break
+				
+				# Skip empty / heartbeat messages (None)
+				if attendance is None:
+					continue
+					
+				# Safely extract attributes (pyzk Attendance object can vary by device)
+				user_id_raw = getattr(attendance, 'user_id', getattr(attendance, 'uid', None))
+				user_id = _normalize_user_id(user_id_raw)
+				timestamp = getattr(attendance, 'timestamp', getattr(attendance, 'time', None))
+				status = getattr(attendance, 'status', None)
+				punch = getattr(attendance, 'punch', getattr(attendance, 'type', None))
+				
+				logger.info("LiveCapture %s: <Attendance>: %s : %s (%s, %s)", device.ip, user_id, timestamp, status, punch)
+
+				# Insert into TimeAttandanceLog
+				if db_conn is not None and user_id is not None:
+					ts_dt = _parse_attendance_timestamp(timestamp) or datetime.now()
+					inserted = upsert_attendance_log(db_conn, user_id, device.ip, ts_dt)
+					if inserted:
+						logger.info("Processed attendance for emp=%s at %s", user_id, ts_dt)
+					else:
+						logger.debug("Skipped or updated (duplicate/threshold) for emp=%s", user_id)
+						
+		except Exception as e:
+			if not STOP_EVENT.is_set():
+				logger.error("Device %s (%s) connection error: %s. Retrying in 30 seconds...", device.name, device.ip, e)
+		finally:
+			try:
+				if conn:
+					conn.disconnect()
+			except Exception:
+				pass
+			try:
+				if db_conn:
+					db_conn.close()
+			except Exception:
+				pass
+			logger.info("Disconnected/Closed session for %s (%s)", device.name, device.ip)
+
+		# Wait before reconnecting, but check STOP_EVENT frequently
+		if not STOP_EVENT.is_set():
+			STOP_EVENT.wait(30)
 
 
 def setup_signal_handlers(threads: List[threading.Thread]):
