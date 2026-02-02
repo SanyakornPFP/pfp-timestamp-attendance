@@ -128,24 +128,41 @@ def cleanup_incomplete_records(db: pyodbc.Connection) -> int:
             # พยายามหาแผนงาน (Shift) เพื่อดึงเวลาเลิกงานจริงมาใส่
             try:
                 dt_period = dt_stamp.date() if hasattr(dt_stamp, "date") else dt_stamp
+                # ปรับปรุง Query ให้ดึงข้อมูลที่ละเอียดขึ้น และกรองวันหยุดออกหากมีกะงานปกติ
                 cur.execute(
                     """
-                    SELECT TOP 1 [OutTmp]
+                    SELECT [InTmp], [OutTmp], [HoliDay]
                     FROM [db_pfpdashboard].[dbo].[VListPeriodEmployee] WITH (NOLOCK)
                     WHERE [EmpId] = ? AND [DatePeriod] = ?
+                    ORDER BY [HoliDay] ASC, [InTmp] DESC
                     """,
                     emp_id, dt_period
                 )
-                shift_row = cur.fetchone()
-                if shift_row and shift_row[0]:
-                    t_str = str(shift_row[0])[:5]  # "HH:mm"
-                    out_time = datetime.strptime(t_str, "%H:%M").time()
-                    base_date = dt_stamp.date() if hasattr(dt_stamp, "date") else dt_stamp
-                    auto_timeout = datetime.combine(base_date, out_time)
+                shift_rows = cur.fetchall()
+                
+                for s_row in shift_rows:
+                    in_val, out_val, holiday = s_row
+                    
+                    # ตรวจสอบกรณีวันหยุด (HoliDay = 1 และ InTmp = 00:00) 
+                    # ให้ข้ามไปหากะงานอื่น (ถ้ามี) เพื่อหลีกเลี่ยงการใช้เวลา 00:00 ที่ไม่ใช่เวลาเลิกงานจริง
+                    is_zero_planned = str(in_val).startswith("00:00")
+                    if holiday == 1 and is_zero_planned:
+                        continue
 
-                    # กรณีข้ามวัน
-                    if t_in and auto_timeout <= t_in:
-                        auto_timeout += timedelta(days=1)
+                    if out_val:
+                        try:
+                            t_str = str(out_val)[:5]  # "HH:mm"
+                            out_time = datetime.strptime(t_str, "%H:%M").time()
+                            base_date = dt_stamp.date() if hasattr(dt_stamp, "date") else dt_stamp
+                            auto_timeout = datetime.combine(base_date, out_time)
+
+                            # กรณีข้ามวัน (ถ้าเลิกงานเช้าอีกวัน เช่น กะดึก)
+                            if t_in and auto_timeout <= t_in:
+                                auto_timeout += timedelta(days=1)
+                            
+                            break # เมื่อพบเวลาเลิกงานที่เหมาะสมแล้วให้หยุดค้นหา
+                        except:
+                            continue
             except Exception as e:
                 logger.debug("Shift lookup failed for record %s: %s", r_id, e)
 
@@ -185,6 +202,9 @@ def run_cleanup_loop():
     )
 
     while not STOP_FLAG:
+        now = datetime.now()
+        
+        # รัน Cleanup ทันทีที่เริ่มโปรแกรม (รอบแรก) หรือเข้าสู่ลูป
         db_conn = _open_sql_connection()
         if db_conn:
             try:
@@ -195,9 +215,22 @@ def run_cleanup_loop():
         else:
             logger.warning("Skipped cleanup cycle due to DB connection failure.")
 
-        # รอจนถึงรอบถัดไป (เช็ค STOP_FLAG ทุก 10 วินาที)
-        wait_cycles = CLEANUP_INTERVAL_SECONDS // 10
-        for _ in range(wait_cycles):
+        # คำนวณเวลาที่จะรันรอบถัดไป (ทุกๆ 4 ชม. เช่น 02:00, 06:00, 10:00, 14:00, 18:00, 22:00)
+        current_hour = now.hour
+        next_run_hour = ((current_hour // 4) + 1) * 4
+        
+        if next_run_hour >= 24:
+            # ขึ้นวันใหม่
+            next_run_time = (now + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+        else:
+            next_run_time = now.replace(hour=next_run_hour, minute=0, second=0, microsecond=0)
+
+        wait_seconds = (next_run_time - now).total_seconds()
+        logger.info("Next cleanup scheduled at: %s (waiting %.1f minutes)", next_run_time.strftime("%H:%M:%S"), wait_seconds / 60)
+
+        # รอจนถึงเวลาถัดไป (เช็ค STOP_FLAG ทุก 10 วินาที)
+        start_wait = datetime.now()
+        while (datetime.now() - start_wait).total_seconds() < wait_seconds:
             if STOP_FLAG:
                 break
             time.sleep(10)
