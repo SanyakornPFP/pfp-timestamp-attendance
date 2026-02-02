@@ -28,6 +28,8 @@ STOP_EVENT = threading.Event()
 # Load environment variables from .env if present
 load_dotenv()
 
+# หมายเหตุ: สำหรับระบบ Cleanup ย้ายไปใช้งาน cleanup_service.py แยกเป็นอีกบริการหนึ่งแล้ว
+
 
 def _choose_sql_driver(env_driver: Optional[str] = None) -> Optional[str]:
 	available_drivers = [d for d in pyodbc.drivers() if d and d.strip()]
@@ -226,49 +228,56 @@ def upsert_attendance_log(db: pyodbc.Connection, emp_id: str, ip: str, ts: datet
 				window_end = shift_end + timedelta(hours=8)
 				is_same_shift = window_start <= l_in <= window_end
 
-			# กรณีไม่มีกะ (shift_date=None) ให้ตรวจสอบว่า Record เก่าเกิน 16 ชม. หรือไม่
-			is_too_old = False
-			if l_out is None:
-				ref_time = l_in if l_in else l_dt_stamp
-				is_too_old = (ts - ref_time).total_seconds() > 16 * 3600
-
 			# AUTO_CLEANUP: ตัดสินใจว่าควร cleanup หรือไม่
 			# - ถ้ามีกะ (shift_date != None): cleanup เมื่อไม่อยู่ในกะเดียวกัน
-			# - ถ้าไม่มีกะ (shift_date = None): cleanup เมื่อ Record เก่าเกิน 16 ชม.
+			# - หมายเหตุ: กรณีไม่มีกะ ปล่อยให้ cleanup_service.py เป็นตัวจัดการตามเกณฑ์เวลา (16 ชม.)
 			should_cleanup = False
-			if l_out is None:
-				if shift_date:
-					# มีกะ → cleanup ถ้าไม่อยู่ในกะเดียวกัน
-					should_cleanup = not is_same_shift
-				else:
-					# ไม่มีกะ → cleanup ถ้าเก่าเกิน 16 ชม.
-					should_cleanup = is_too_old
+			if l_out is None and shift_date:
+				# มีกะ → cleanup ถ้าไม่อยู่ในกะเดียวกัน
+				should_cleanup = not is_same_shift
 
 			if should_cleanup:
-				# ค้นหาเวลาเลิกงานตามแผนของกะเก่านั้น
-				cur.execute(
-					"SELECT [OutTmp] FROM [db_pfpdashboard].[dbo].[VListPeriodEmployee] WHERE [EmpId] = ? AND [DatePeriod] = ?",
-					emp_id, l_dt_stamp
-				)
-				old_shift_out = cur.fetchone()
-				if old_shift_out and old_shift_out[0]:
-					# สร้าง datetime ของเวลาเลิกงานเดิม
-					try:
-						t_str = str(old_shift_out[0])[:5]
-						out_time = datetime.strptime(t_str, "%H:%M").time()
-						auto_timeout = datetime.combine(l_dt_stamp.date() if hasattr(l_dt_stamp, "date") else l_dt_stamp, out_time)
-						# ถ้าเลิกงานเช้าอีกวัน
-						if l_in and auto_timeout <= l_in:
-							auto_timeout += timedelta(days=1)
-						
-						cur.execute(
-							"UPDATE [EmpBook_db].[dbo].[TimeAttandanceLog] SET [TimeOut] = ?, [IPStampOut] = 'AUTO_CLEANUP' WHERE [Id] = ?",
-							auto_timeout, l_id
-						)
-						db.commit()
-						logger.info("Auto-closed incomplete shift for emp=%s (Record ID: %s, TimeOut: %s)", emp_id, l_id, auto_timeout)
-					except Exception as e:
-						logger.warning("Failed to auto-close shift for emp=%s: %s", emp_id, e)
+				# ค้นหาเวลาเลิกงานตามแผนของกะเก่านั้น (ปรับปรุง logic ให้แม่นยำขึ้นเหมือน cleanup_service.py)
+				try:
+					l_dt_period = l_dt_stamp.date() if hasattr(l_dt_stamp, "date") else l_dt_stamp
+					cur.execute(
+						"""
+						SELECT [InTmp], [OutTmp], [HoliDay]
+						FROM [db_pfpdashboard].[dbo].[VListPeriodEmployee] WITH (NOLOCK)
+						WHERE [EmpId] = ? AND [DatePeriod] = ?
+						ORDER BY [HoliDay] ASC, [InTmp] DESC
+						""",
+						emp_id, l_dt_period
+					)
+					shift_rows = cur.fetchall()
+					
+					auto_timeout = ref_time # Default
+					for s_row in shift_rows:
+						in_val, out_val, holiday = s_row
+						is_zero_planned = str(in_val).startswith("00:00")
+						if holiday == 1 and is_zero_planned:
+							continue
+
+						if out_val:
+							try:
+								t_str = str(out_val)[:5]
+								out_time = datetime.strptime(t_str, "%H:%M").time()
+								base_date = l_dt_period
+								auto_timeout = datetime.combine(base_date, out_time)
+								if l_in and auto_timeout <= l_in:
+									auto_timeout += timedelta(days=1)
+								break
+							except:
+								continue
+
+					cur.execute(
+						"UPDATE [EmpBook_db].[dbo].[TimeAttandanceLog] SET [TimeOut] = ?, [IPStampOut] = 'AUTO_CLEANUP' WHERE [Id] = ?",
+						auto_timeout, l_id
+					)
+					db.commit()
+					logger.info("Auto-closed incomplete shift for emp=%s (Record ID: %s, TimeOut: %s)", emp_id, l_id, auto_timeout)
+				except Exception as e:
+					logger.warning("Failed to auto-close shift for emp=%s: %s", emp_id, e)
 
 		# 3. ค้นหา Record เดิมที่อยู่ในช่วงกะงานนี้ (เพื่อทำการ Update TimeOut ปกติ)
 		if shift_date:
@@ -377,159 +386,82 @@ def upsert_attendance_log(db: pyodbc.Connection, emp_id: str, ip: str, ts: datet
 		return False
 
 
-def global_auto_cleanup(db: pyodbc.Connection):
-	"""ตรวจสอบ Record ทั้งหมดใน TimeAttandanceLog ที่ไม่มีเวลาออก (TimeOut IS NULL)
-	หากเวลาผ่านไปนานกว่า 16 ชม. จะทำการ AUTO_CLEANUP
-	"""
-	try:
-		cur = db.cursor()
-		# กำหนดเกณฑ์เวลา 16 ชั่วโมงที่แล้ว
-		threshold_time = datetime.now() - timedelta(hours=16)
-
-		# ค้นหา Record ที่ค้าง (TimeOut เป็น NULL) และเก่ากว่า 16 ชม.
-		cur.execute(
-			"""
-			SELECT [Id], [EmpId], [DateTimeStamp], [TimeIn]
-			FROM [EmpBook_db].[dbo].[TimeAttandanceLog] WITH (NOLOCK)
-			WHERE [TimeOut] IS NULL
-			  AND (
-				([TimeIn] IS NOT NULL AND [TimeIn] < ?)
-				OR
-				([TimeIn] IS NULL AND [DateTimeStamp] < ?)
-			  )
-			""",
-			threshold_time, threshold_time
-		)
-		records = cur.fetchall()
-
-		if not records:
-			return
-
-		logger.info("Global cleanup: Found %d incomplete records older than 16h.", len(records))
-
-		for row in records:
-			r_id, emp_id, dt_stamp, t_in = row
-			ref_time = t_in if t_in else dt_stamp
-			
-			# ค่า Default สำหรับ TimeOut คือเวลาเดียวกับ TimeIn (เพื่อให้ Record สมบูรณ์ แต่ระยะเวลาเป็น 0)
-			auto_timeout = ref_time
-
-			# พยายามหาแผนงาน (Shift) เพื่อดึงเวลาเลิกงานจริงมาใส่
-			try:
-				dt_period = dt_stamp.date() if hasattr(dt_stamp, "date") else dt_stamp
-				cur.execute(
-					"SELECT TOP 1 [OutTmp] FROM [db_pfpdashboard].[dbo].[VListPeriodEmployee] WITH (NOLOCK) WHERE [EmpId] = ? AND [DatePeriod] = ?",
-					emp_id, dt_period
-				)
-				shift_row = cur.fetchone()
-				if shift_row and shift_row[0]:
-					t_str = str(shift_row[0])[:5] # "HH:mm"
-					out_time = datetime.strptime(t_str, "%H:%M").time()
-					base_date = dt_stamp.date() if hasattr(dt_stamp, "date") else dt_stamp
-					auto_timeout = datetime.combine(base_date, out_time)
-
-					# กรณีข้ามวัน
-					if t_in and auto_timeout <= t_in:
-						auto_timeout += timedelta(days=1)
-			except Exception as e:
-				logger.debug("Shift lookup failed during cleanup for record %s: %s", r_id, e)
-
-			# อัปเดตข้อมูล
-			cur.execute(
-				"UPDATE [EmpBook_db].[dbo].[TimeAttandanceLog] SET [TimeOut] = ?, [IPStampOut] = 'AUTO_CLEANUP' WHERE [Id] = ?",
-				auto_timeout, r_id
-			)
-			db.commit()
-			logger.info("Global cleanup: Record ID %s (Emp: %s) auto-closed with TimeOut: %s", r_id, emp_id, auto_timeout)
-
-	except Exception as e:
-		logger.error("Global cleanup failed: %s", e)
-		try: db.rollback()
-		except: pass
-
-
-def run_cleanup_worker():
-	"""Thread สำหรับรัน global_auto_cleanup เป็นระยะๆ"""
-	logger.info("Cleanup worker started.")
-	while not STOP_EVENT.is_set():
-		db_conn = _open_sql_connection()
-		if db_conn:
-			global_auto_cleanup(db_conn)
-			db_conn.close()
-		
-		# รอ 1 ชม. (เช็ค STOP_EVENT ทุก 10 วินาที เพื่อให้ปิด thread ได้เร็วขึ้น)
-		for _ in range(360): 
-			if STOP_EVENT.is_set():
-				break
-			STOP_EVENT.wait(10)
-	logger.info("Cleanup worker stopped.")
+# หมายเหตุ: ฟังก์ชัน global_auto_cleanup และ run_cleanup_worker ถูกย้ายไปที่ cleanup_service.py แล้ว
 
 
 def run_live_capture(device: Device, port: int) -> None:
 	"""Connect to a ZKTeco device and stream live attendance events.
 
-	Only uses the live_capture() generator. Runs until STOP_EVENT is set.
+	Runs in a loop to automatically reconnect if the connection is lost.
+	Runs until STOP_EVENT is set.
 	"""
-	zk = ZK(
-		device.ip,
-		port=port,
-		timeout=10,
-		password=0,
-		force_udp=False,
-		ommit_ping=False,
-	)
-	conn = None
-	db_conn = None
-	try:
-		logger.info("Connecting to device '%s' (%s:%d)", device.name, device.ip, port)
-		conn = zk.connect()
-		logger.info("Connected: %s (%s)", device.name, device.ip)
-		# Open a DB connection for this thread
-		db_conn = _open_sql_connection()
-		if db_conn is None:
-			logger.error("DB connection unavailable; live capture will still run but inserts disabled.")
-
-		# live_capture is a generator producing attendance events continuously
-		for attendance in conn.live_capture():
-			if STOP_EVENT.is_set():
-				break
-			# Skip empty / heartbeat messages (None)
-			if attendance is None:
-				continue
-			# Safely extract attributes (pyzk Attendance object can vary by device)
-			user_id_raw = getattr(attendance, 'user_id', getattr(attendance, 'uid', None))
-			user_id = _normalize_user_id(user_id_raw)
-			timestamp = getattr(attendance, 'timestamp', getattr(attendance, 'time', None))
-			status = getattr(attendance, 'status', None)
-			punch = getattr(attendance, 'punch', getattr(attendance, 'type', None))
-			# Format similar to requested example
-			# Only log when it's a real attendance
-			logger.info("LiveCapture %s: <Attendance>: %s : %s (%s, %s)", device.ip, user_id, timestamp, status, punch)
-
-			# Insert into TimeAttandanceLog
-			if db_conn is not None and user_id is not None:
-				ts_dt = _parse_attendance_timestamp(timestamp) or datetime.now()
-				inserted = upsert_attendance_log(db_conn, user_id, device.ip, ts_dt)
-				if inserted:
-					logger.info("Processed attendance for emp=%s at %s", user_id, ts_dt)
-				else:
-					logger.debug("Skipped or updated (duplicate/threshold) for emp=%s", user_id)
-	except KeyboardInterrupt:
-		pass
-	except Exception as e:
-		logger.error("Device %s (%s) error: %s", device.name, device.ip, e)
-	finally:
+	while not STOP_EVENT.is_set():
+		zk = ZK(
+			device.ip,
+			port=port,
+			timeout=10,
+			password=0,
+			force_udp=False,
+			ommit_ping=False,
+		)
+		conn = None
+		db_conn = None
 		try:
-			if conn:
-				conn.disconnect()
-		except Exception:
-			pass
-		try:
-			if db_conn:
-				db_conn.close()
-		except Exception:
-			pass
-		logger.info("Disconnected from %s (%s)", device.name, device.ip)
+			logger.info("Connecting to device '%s' (%s:%d)", device.name, device.ip, port)
+			conn = zk.connect()
+			logger.info("Connected to %s (%s)", device.name, device.ip)
+			
+			# Open a DB connection for this thread
+			db_conn = _open_sql_connection()
+			if db_conn is None:
+				logger.error("DB connection unavailable for %s; live capture will run but SQL inserts disabled.", device.ip)
+
+			# live_capture is a generator producing attendance events continuously
+			for attendance in conn.live_capture():
+				if STOP_EVENT.is_set():
+					break
+				
+				# Skip empty / heartbeat messages (None)
+				if attendance is None:
+					continue
+					
+				# Safely extract attributes (pyzk Attendance object can vary by device)
+				user_id_raw = getattr(attendance, 'user_id', getattr(attendance, 'uid', None))
+				user_id = _normalize_user_id(user_id_raw)
+				timestamp = getattr(attendance, 'timestamp', getattr(attendance, 'time', None))
+				status = getattr(attendance, 'status', None)
+				punch = getattr(attendance, 'punch', getattr(attendance, 'type', None))
+				
+				logger.info("LiveCapture %s: <Attendance>: %s : %s (%s, %s)", device.ip, user_id, timestamp, status, punch)
+
+				# Insert into TimeAttandanceLog
+				if db_conn is not None and user_id is not None:
+					ts_dt = _parse_attendance_timestamp(timestamp) or datetime.now()
+					inserted = upsert_attendance_log(db_conn, user_id, device.ip, ts_dt)
+					if inserted:
+						logger.info("Processed attendance for emp=%s at %s", user_id, ts_dt)
+					else:
+						logger.debug("Skipped or updated (duplicate/threshold) for emp=%s", user_id)
+						
+		except Exception as e:
+			if not STOP_EVENT.is_set():
+				logger.error("Device %s (%s) connection error: %s. Retrying in 30 seconds...", device.name, device.ip, e)
+		finally:
+			try:
+				if conn:
+					conn.disconnect()
+			except Exception:
+				pass
+			try:
+				if db_conn:
+					db_conn.close()
+			except Exception:
+				pass
+			logger.info("Disconnected/Closed session for %s (%s)", device.name, device.ip)
+
+		# Wait before reconnecting, but check STOP_EVENT frequently
+		if not STOP_EVENT.is_set():
+			STOP_EVENT.wait(30)
 
 
 def setup_signal_handlers(threads: List[threading.Thread]):
@@ -566,11 +498,8 @@ def main():
 				", ".join(f"{d.name}({d.ip})" for d in devices))
 
 	threads: List[threading.Thread] = []
-	
-	# Start Cleanup Worker Thread
-	cleanup_t = threading.Thread(target=run_cleanup_worker, name="CleanupWorker", daemon=True)
-	threads.append(cleanup_t)
-	cleanup_t.start()
+
+	# หมายเหตุ: ตัดส่วน Cleanup Worker Thread ออก เนื่องจากใช้งาน cleanup_service.py แทนแล้ว
 
 	for device in devices:
 		t = threading.Thread(
