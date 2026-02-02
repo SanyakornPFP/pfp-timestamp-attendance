@@ -251,24 +251,46 @@ def upsert_attendance_log(db: pyodbc.Connection, emp_id: str, ip: str, ts: datet
 					)
 					shift_rows = cur.fetchall()
 					
-					auto_timeout = ref_time # Default
+					# กำหนดค่าเริ่มต้นเป็นเวลาแสกนเข้า (ถ้ามี) หรือเวลาแสตมป์
+					auto_timeout = l_in if l_in else l_dt_stamp
+					
+					valid_shifts = []
 					for s_row in shift_rows:
 						in_val, out_val, holiday = s_row
 						is_zero_planned = str(in_val).startswith("00:00")
 						if holiday == 1 and is_zero_planned:
 							continue
-
 						if out_val:
-							try:
-								t_str = str(out_val)[:5]
-								out_time = datetime.strptime(t_str, "%H:%M").time()
-								base_date = l_dt_period
-								auto_timeout = datetime.combine(base_date, out_time)
-								if l_in and auto_timeout <= l_in:
-									auto_timeout += timedelta(days=1)
-								break
-							except:
-								continue
+							valid_shifts.append(s_row)
+
+					# FALLBACK: ถ้าไม่เจอกะในวันนั้น ให้หากะล่าสุดที่มีก่อนหน้านั้น
+					if not valid_shifts:
+						cur.execute(
+							"""
+							SELECT TOP 1 [InTmp], [OutTmp], [HoliDay]
+							FROM [db_pfpdashboard].[dbo].[VListPeriodEmployee] WITH (NOLOCK)
+							WHERE [EmpId] = ? AND [DatePeriod] < ?
+							  AND [InTmp] IS NOT NULL AND [InTmp] NOT LIKE '00:00%'
+							ORDER BY [DatePeriod] DESC
+							""",
+							emp_id, l_dt_period
+						)
+						fallback_row = cur.fetchone()
+						if fallback_row:
+							valid_shifts = [fallback_row]
+
+					for s_row in valid_shifts:
+						in_val, out_val, holiday = s_row
+						try:
+							t_str = str(out_val)[:5]
+							out_time = datetime.strptime(t_str, "%H:%M").time()
+							base_date = l_dt_period
+							auto_timeout = datetime.combine(base_date, out_time)
+							if l_in and auto_timeout <= l_in:
+								auto_timeout += timedelta(days=1)
+							break
+						except:
+							continue
 
 					cur.execute(
 						"UPDATE [EmpBook_db].[dbo].[TimeAttandanceLog] SET [TimeOut] = ?, [IPStampOut] = 'AUTO_CLEANUP' WHERE [Id] = ?",
